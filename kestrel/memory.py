@@ -163,8 +163,14 @@ class TitansMAGForCausalLM(nn.Module):
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.apply(self._init_weights)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
+
+    @staticmethod
+    def _init_weights(module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def get_input_embeddings(self):
         return self.embed_tokens
