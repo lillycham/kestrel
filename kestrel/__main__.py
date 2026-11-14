@@ -3,7 +3,7 @@ import json
 
 from .core import make_model, read_config
 from .data import prepare, train_tokenizer
-from .train import sample, train
+from .train import chat, sample, train
 
 
 def main():
@@ -38,6 +38,15 @@ def main():
     generation.add_argument("--top-p", type=float, default=1.0)
     generation.add_argument("--raw", action="store_true", help="Sample from raw prompt without chat template")
     generation.add_argument("--seed", type=int, default=42)
+    interactive = sub.add_parser("chat", help="Interactive multi-turn chat loop")
+    interactive.add_argument("--run", required=True)
+    interactive.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
+    interactive.add_argument("--max-new-tokens", type=int, default=256)
+    interactive.add_argument("--temperature", type=float, default=0.7)
+    interactive.add_argument("--top-k", type=int, default=50)
+    interactive.add_argument("--top-p", type=float, default=0.9)
+    interactive.add_argument("--system")
+    interactive.add_argument("--seed", type=int, default=42)
     args = vars(parser.parse_args())
     command = args.pop("command")
     if command == "inspect":
@@ -52,9 +61,12 @@ def main():
         prepare(args["train"], args["validation"], args["tokenizer"], args["output"])
     elif command == "train":
         train(args["config"], args["data"], args["output"], args["device"], args["resume"], args["stop_after"], args["init_from"])
-    else:
+    elif command == "sample":
         sample(args["run"], args["prompt"], args["device"], args["max_new_tokens"],
                args["temperature"], args["seed"], args["top_k"], args["top_p"], args["raw"])
+    else:
+        chat(args["run"], args["device"], args["max_new_tokens"], args["temperature"],
+             args["seed"], args["top_k"], args["top_p"], args["system"])
 
 
 if __name__ == "__main__":

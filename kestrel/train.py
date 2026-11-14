@@ -196,10 +196,7 @@ def train(config_path, data_path, output, requested_device="auto", resume=False,
     return raw_model
 
 
-@torch.no_grad()
-def sample(run, prompt, requested_device="cpu", max_new_tokens=64, temperature=0.8, seed=42, top_k=0, top_p=1.0, raw=False):
-    if max_new_tokens < 1 or temperature < 0 or top_k < 0 or not (0 < top_p <= 1.0):
-        raise ValueError("Use positive max_new_tokens, nonnegative temperature/top_k, and 0 < top_p <= 1")
+def _load_for_inference(run, requested_device, seed):
     device = choose_device(requested_device)
     torch.manual_seed(seed)
     run = Path(run)
@@ -210,22 +207,81 @@ def sample(run, prompt, requested_device="cpu", max_new_tokens=64, temperature=0
         "pad_token_id": tokenizer.pad_token_id,
     }).to(device).eval()
     model.load_state_dict(saved["model"])
+    # Unused model output rows must never be sampled.
+    unused = [[index] for index in range(len(tokenizer), model.config.vocab_size)]
+    return model, tokenizer, device, unused or None
+
+
+def _sampling_options(max_new_tokens, temperature, top_k, top_p):
+    if max_new_tokens < 1 or temperature < 0 or top_k < 0 or not (0 < top_p <= 1.0):
+        raise ValueError("Use positive max_new_tokens, nonnegative temperature/top_k, and 0 < top_p <= 1")
+    options = {"do_sample": temperature > 0}
+    if temperature > 0:
+        options.update(temperature=temperature, top_k=top_k, top_p=top_p)
+    return options
+
+
+@torch.no_grad()
+def sample(run, prompt, requested_device="cpu", max_new_tokens=64, temperature=0.8, seed=42, top_k=0, top_p=1.0, raw=False):
+    options = _sampling_options(max_new_tokens, temperature, top_k, top_p)
+    model, tokenizer, device, bad_words_ids = _load_for_inference(run, requested_device, seed)
     text = prompt if raw else tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True,
     )
     inputs = tokenizer(text, return_tensors="pt").to(device)
     if inputs.input_ids.shape[1] + max_new_tokens > model.config.max_position_embeddings:
         raise ValueError("Prompt plus generation exceeds configured context")
-    options = {"do_sample": temperature > 0}
-    if temperature > 0:
-        options.update(temperature=temperature, top_k=top_k, top_p=top_p)
-    # A tokenizer may contain fewer tokens than its requested BPE target.
-    # Unused model output rows must never be sampled.
-    unused = [[index] for index in range(len(tokenizer), model.config.vocab_size)]
     eos_ids = tokenizer.eos_token_id if raw else [tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids("<|end|>")]
     result = model.generate(
         **inputs, max_new_tokens=max_new_tokens, use_cache=True,
-        eos_token_id=eos_ids, pad_token_id=tokenizer.pad_token_id, bad_words_ids=unused or None, **options,
+        eos_token_id=eos_ids, pad_token_id=tokenizer.pad_token_id, bad_words_ids=bad_words_ids, **options,
     )
     tokens = result[0] if raw else result[0, inputs.input_ids.shape[1]:]
     print(tokenizer.decode(tokens, skip_special_tokens=True))
+
+
+@torch.no_grad()
+def chat(run, requested_device="auto", max_new_tokens=256, temperature=0.7, seed=42, top_k=50, top_p=0.9, system=None):
+    """Interactive multi-turn chat loop with automatic history trimming."""
+    options = _sampling_options(max_new_tokens, temperature, top_k, top_p)
+    model, tokenizer, device, bad_words_ids = _load_for_inference(run, requested_device, seed)
+    eos_ids = [tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids("<|end|>")]
+    base_history = [{"role": "system", "content": system}] if system else []
+    messages = list(base_history)
+    max_ctx = model.config.max_position_embeddings
+    print("Commands: /reset to clear history, /quit or Ctrl-D to exit.")
+    while True:
+        try:
+            prompt = input("you> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not prompt:
+            continue
+        if prompt in {"/quit", "/exit"}:
+            break
+        if prompt == "/reset":
+            messages = list(base_history)
+            print("(history cleared)")
+            continue
+        messages.append({"role": "user", "content": prompt})
+        min_head = 1 if system else 0
+        while True:
+            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            inputs = tokenizer(text, return_tensors="pt").to(device)
+            available = max_ctx - inputs.input_ids.shape[1]
+            if available >= min(max_new_tokens, 32) or len(messages) <= min_head + 1:
+                break
+            # Drop the oldest user+assistant pair while preserving any system message.
+            del messages[min_head:min_head + 2]
+        if available < 1:
+            messages.pop()
+            print("(prompt exceeds model context; try a shorter message or /reset)")
+            continue
+        result = model.generate(
+            **inputs, max_new_tokens=min(max_new_tokens, available), use_cache=True,
+            eos_token_id=eos_ids, pad_token_id=tokenizer.pad_token_id, bad_words_ids=bad_words_ids, **options,
+        )
+        reply = tokenizer.decode(result[0, inputs.input_ids.shape[1]:], skip_special_tokens=True)
+        print(f"kestrel> {reply}\n")
+        messages.append({"role": "assistant", "content": reply})

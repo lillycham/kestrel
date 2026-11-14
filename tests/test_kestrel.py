@@ -6,7 +6,7 @@ import torch
 
 from kestrel.core import make_model, make_optimizers, read_config, resolve_precision, wsd
 from kestrel.data import load_tokenizer, prepare, rows, train_tokenizer
-from kestrel.train import mask_assistant_targets, sample, train
+from kestrel.train import chat, mask_assistant_targets, sample, train
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -100,6 +100,58 @@ def test_end_to_end_and_exact_cpu_resume(tmp_path, capsys):
         sample(tmp_path / "full", "hello", top_k=-1)
     with pytest.raises(ValueError):
         sample(tmp_path / "full", "hello", top_p=1.5)
+
+
+def test_chat_loop(tmp_path, monkeypatch, capsys):
+    training = tmp_path / "train.jsonl"
+    validation = tmp_path / "validation.jsonl"
+    training.write_text("\n".join(json.dumps({"messages": [
+        {"role": "user", "content": f"hello {i}"},
+        {"role": "assistant", "content": f"hi {i}"},
+    ]}) for i in range(12)))
+    validation.write_text("\n".join(json.dumps({"messages": [
+        {"role": "user", "content": f"val {i}"},
+        {"role": "assistant", "content": f"reply {i}"},
+    ]}) for i in range(4)))
+    tokenizer_path = tmp_path / "tokenizer"
+    train_tokenizer(training, tokenizer_path, 512)
+    data_path = tmp_path / "encoded"
+    prepare(training, validation, tokenizer_path, data_path)
+    train(ROOT / "configs/smoke.toml", data_path, tmp_path / "run", "cpu", stop_after=2)
+
+    inputs = iter(["hello", "/reset", "bye", "/quit"])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+    chat(tmp_path / "run", requested_device="cpu", max_new_tokens=3, temperature=0)
+    out = capsys.readouterr().out
+    assert out.count("kestrel>") == 2
+    assert "(history cleared)" in out
+
+
+def test_titans_mag_causality_and_train(tmp_path):
+    cfg = read_config(ROOT / "configs/titans_smoke.toml")
+    model = make_model(cfg["model"]).eval()
+    assert model.lm_head.weight is model.embed_tokens.weight
+    muon, adam = make_optimizers(model, cfg["train"])
+    ids = [id(p) for o in (muon, adam) for g in o.param_groups for p in g["params"]]
+    assert len(ids) == len(set(ids)) == len(list(model.parameters()))
+
+    # Token-level causality across multiple chunks (chunk_size=4, seq=10).
+    x = torch.randint(10, 100, (1, 10))
+    y = x.clone()
+    y[:, 5:] = torch.randint(100, 200, (1, 5))
+    with torch.no_grad():
+        torch.testing.assert_close(model(x).logits[:, :5], model(y).logits[:, :5])
+
+    training = tmp_path / "train.jsonl"
+    validation = tmp_path / "validation.jsonl"
+    training.write_text("\n".join(json.dumps({"text": f"long document {i} " * 8}) for i in range(12)))
+    validation.write_text("\n".join(json.dumps({"text": f"val document {i} " * 8}) for i in range(4)))
+    tokenizer_path = tmp_path / "tokenizer"
+    train_tokenizer(training, tokenizer_path, 512)
+    data_path = tmp_path / "encoded"
+    prepare(training, validation, tokenizer_path, data_path)
+    train(ROOT / "configs/titans_smoke.toml", data_path, tmp_path / "titans", "cpu")
+    sample(tmp_path / "titans", "long", max_new_tokens=4, temperature=0, raw=True)
 
 
 def test_precision_and_compile_config(tmp_path):

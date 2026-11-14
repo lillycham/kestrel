@@ -7,6 +7,8 @@ from pathlib import Path
 import torch
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
+from .memory import TitansMAGForCausalLM
+
 
 def read_config(path):
     with Path(path).open("rb") as source:
@@ -19,6 +21,7 @@ def read_config(path):
         "num_attention_heads", "num_key_value_heads", "head_dim",
         "max_position_embeddings", "tie_word_embeddings", "attention_bias",
         "attention_dropout", "rms_norm_eps", "rope_theta",
+        "memory_chunk_size", "memory_hidden_size", "attention_window",
     }
     if set(model) - allowed_model:
         raise ValueError(f"Unknown model options: {set(model) - allowed_model}")
@@ -56,6 +59,9 @@ def read_config(path):
 def make_model(settings, special_ids=None):
     settings = dict(settings)
     theta = settings.pop("rope_theta", 10000.0)
+    memory_chunk = settings.pop("memory_chunk_size", None)
+    memory_hidden = settings.pop("memory_hidden_size", None)
+    attention_window = settings.pop("attention_window", None)
     width = settings["hidden_size"]
     heads = settings["num_attention_heads"]
     kv_heads = settings["num_key_value_heads"]
@@ -69,6 +75,13 @@ def make_model(settings, special_ids=None):
         rope_parameters={"rope_type": "default", "rope_theta": theta},
         use_cache=False,
     )
+    if memory_chunk is not None or memory_hidden is not None or attention_window is not None:
+        if min(memory_chunk or 0, memory_hidden or 0, attention_window or 0) <= 0:
+            raise ValueError("Titans-MAG requires positive memory_chunk_size, memory_hidden_size, and attention_window")
+        config.memory_chunk_size = memory_chunk
+        config.memory_hidden_size = memory_hidden
+        config.attention_window = attention_window
+        return TitansMAGForCausalLM(config)
     config._attn_implementation = "sdpa"
     return Qwen3ForCausalLM(config)
 
