@@ -43,18 +43,18 @@ class NeuralMemory(nn.Module):
         padded_len = x.shape[1]
         num_chunks = padded_len // c
 
-        q = F.normalize(self.q_proj(x), dim=-1).view(bsz, num_chunks, c, dim)
-        k = F.normalize(self.k_proj(x), dim=-1).view(bsz, num_chunks, c, dim)
-        v = self.v_proj(x).view(bsz, num_chunks, c, dim)
+        q = F.normalize(self.q_proj(x), dim=-1).view(bsz, num_chunks, c, dim).float()
+        k = F.normalize(self.k_proj(x), dim=-1).view(bsz, num_chunks, c, dim).float()
+        v = F.normalize(self.v_proj(x), dim=-1).view(bsz, num_chunks, c, dim).float()
         # Average chunk hidden state drives scalar forget/momentum/lr gates.
         chunk_ctx = x.view(bsz, num_chunks, c, dim).mean(dim=2)
-        gates = self.gate_proj(chunk_ctx)
+        gates = self.gate_proj(chunk_ctx).float()
         alpha = torch.sigmoid(gates[..., 0] - 2.0)[..., None, None]  # conservative forgetting
         eta = torch.sigmoid(gates[..., 1])[..., None, None]
-        theta = 0.5 * torch.sigmoid(gates[..., 2])[..., None, None]
+        theta = 0.05 * torch.sigmoid(gates[..., 2])[..., None, None]
 
-        w1 = self.w1_init.unsqueeze(0).expand(bsz, -1, -1).clone()
-        w2 = self.w2_init.unsqueeze(0).expand(bsz, -1, -1).clone()
+        w1 = self.w1_init.float().unsqueeze(0).expand(bsz, -1, -1).clone()
+        w2 = self.w2_init.float().unsqueeze(0).expand(bsz, -1, -1).clone()
         s1 = torch.zeros_like(w1)
         s2 = torch.zeros_like(w2)
 
@@ -87,7 +87,7 @@ class NeuralMemory(nn.Module):
             w1 = (1.0 - a_i) * w1 + s1
             w2 = (1.0 - a_i) * w2 + s2
 
-        out = torch.cat(outputs, dim=1)[:, :seq_len]
+        out = torch.cat(outputs, dim=1)[:, :seq_len].to(x.dtype)
         return self.out_proj(out)
 
 
