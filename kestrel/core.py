@@ -27,13 +27,14 @@ def read_config(path):
         "warmup_steps", "decay_steps", "muon_lr", "adamw_lr", "weight_decay",
         "clip_norm", "eval_every", "eval_batches", "save_every", "seed",
     }
-    optional_train = {"precision", "compile"}
+    optional_train = {"precision", "compile", "assistant_only"}
     if set(train) - (required_train | optional_train) or required_train - set(train):
         raise ValueError(f"Train options differ: {set(train) ^ required_train}")
     if "precision" in train and train["precision"] not in {"fp32", "bf16", "auto"}:
         raise ValueError("precision must be 'fp32', 'bf16' or 'auto'")
-    if "compile" in train and not isinstance(train["compile"], bool):
-        raise ValueError("compile must be a boolean")
+    for flag in ("compile", "assistant_only"):
+        if flag in train and not isinstance(train[flag], bool):
+            raise ValueError(f"{flag} must be a boolean")
     for name in ("steps", "batch_size", "sequence_length", "gradient_accumulation",
                  "eval_every", "eval_batches", "save_every"):
         if not isinstance(train[name], int) or train[name] <= 0:

@@ -9,8 +9,28 @@ from pathlib import Path
 from kestrel.data import SPECIAL
 
 
+def format_row(value):
+    if isinstance(value, str):
+        if any(tok in value for tok in SPECIAL):
+            return None
+        return {"text": value}
+    if isinstance(value, list) and value:
+        messages = []
+        for msg in value:
+            if not isinstance(msg, dict):
+                return None
+            role, content = msg.get("role"), msg.get("content")
+            if role not in {"system", "user", "assistant"} or not isinstance(content, str):
+                return None
+            if any(tok in content for tok in SPECIAL):
+                return None
+            messages.append({"role": role, "content": content})
+        return {"messages": messages}
+    return None
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Stream HF text dataset to Kestrel JSONL")
+    parser = argparse.ArgumentParser(description="Stream HF text/chat dataset to Kestrel JSONL")
     parser.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu")
     parser.add_argument("--config", default="sample-10BT")
     parser.add_argument("--split", default="train")
@@ -28,21 +48,22 @@ def main():
     train_path = out / "train.jsonl"
     val_path = out / "validation.jsonl"
 
-    stream = load_dataset(args.dataset, args.config, split=args.split, streaming=True)
+    stream = load_dataset(args.dataset, args.config or None, split=args.split, streaming=True)
     written_val = 0
     written_train = 0
     skipped = 0
 
     with val_path.open("w", encoding="utf-8") as val_f, train_path.open("w", encoding="utf-8") as train_f:
         for row in stream:
-            text = row.get(args.field)
-            if not isinstance(text, str) or len(text) < args.min_chars:
+            val = row.get(args.field)
+            if isinstance(val, str) and len(val) < args.min_chars:
                 skipped += 1
                 continue
-            if any(tok in text for tok in SPECIAL):
+            formatted = format_row(val)
+            if formatted is None:
                 skipped += 1
                 continue
-            line = json.dumps({"text": text}, ensure_ascii=False) + "\n"
+            line = json.dumps(formatted, ensure_ascii=False) + "\n"
             if written_val < args.val_docs:
                 val_f.write(line)
                 written_val += 1

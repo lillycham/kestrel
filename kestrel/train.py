@@ -14,26 +14,65 @@ from .core import choose_device, make_model, make_optimizers, read_config, resol
 from .data import load_data, load_tokenizer
 
 
-def batch(stream, settings, generator, device):
+def mask_assistant_targets(stream, starts, tokens, assistant_id, end_id, non_assistant_ids):
+    """Mask target tokens outside <|assistant|> ... <|end|> spans with -100."""
+    y = tokens[:, 1:].clone()
+    x = tokens[:, :-1]
+    delimiters = non_assistant_ids | {assistant_id, end_id}
+    for row_idx, start in enumerate(starts):
+        in_assistant = False
+        lookback_start = max(0, int(start) - 2048)
+        if int(start) > lookback_start:
+            prefix = np.asarray(stream[lookback_start:int(start)], dtype=np.int64)
+            for tok in reversed(prefix):
+                t = int(tok)
+                if t == assistant_id:
+                    in_assistant = True
+                    break
+                if t in non_assistant_ids or t == end_id:
+                    break
+        for col in range(y.shape[1]):
+            prev_tok = int(x[row_idx, col])
+            target_tok = int(y[row_idx, col])
+            if prev_tok == assistant_id:
+                in_assistant = True
+            elif prev_tok in non_assistant_ids:
+                in_assistant = False
+            if not in_assistant:
+                y[row_idx, col] = -100
+            if target_tok == end_id:
+                in_assistant = False
+    return y
+
+
+def batch(stream, settings, generator, device, assistant_tokens=None):
     length = settings["sequence_length"]
     starts = torch.randint(len(stream) - length, (settings["batch_size"],), generator=generator).numpy()
     offsets = starts[:, None] + np.arange(length + 1)
-    tokens = torch.from_numpy(np.asarray(stream[offsets], dtype=np.int64)).to(device, non_blocking=True)
-    return tokens[:, :-1].contiguous(), tokens[:, 1:].contiguous()
+    tokens = torch.from_numpy(np.asarray(stream[offsets], dtype=np.int64))
+    x = tokens[:, :-1].contiguous().to(device, non_blocking=True)
+    if assistant_tokens is not None:
+        assistant_id, end_id, non_assistant_ids = assistant_tokens
+        y = mask_assistant_targets(stream, starts, tokens, assistant_id, end_id, non_assistant_ids)
+    else:
+        y = tokens[:, 1:].contiguous()
+    return x, y.to(device, non_blocking=True)
 
 
 def loss_on(model, x, y, autocast_ctx=nullcontext):
     # Shift explicitly so we supervise every position in each sampled block.
     with autocast_ctx():
         logits = model(input_ids=x, use_cache=False).logits
-        return torch.nn.functional.cross_entropy(logits.flatten(0, 1), y.flatten())
+        if (y != -100).sum() == 0:
+            return logits.sum() * 0.0
+        return torch.nn.functional.cross_entropy(logits.flatten(0, 1), y.flatten(), ignore_index=-100)
 
 
 @torch.no_grad()
-def evaluate(model, stream, settings, device, autocast_ctx=nullcontext):
+def evaluate(model, stream, settings, device, autocast_ctx=nullcontext, assistant_tokens=None):
     generator = torch.Generator().manual_seed(settings["seed"] + 1)
     model.eval()
-    losses = [loss_on(model, *batch(stream, settings, generator, device), autocast_ctx).item()
+    losses = [loss_on(model, *batch(stream, settings, generator, device, assistant_tokens), autocast_ctx).item()
               for _ in range(settings["eval_batches"])]
     model.train()
     return sum(losses) / len(losses)
@@ -55,7 +94,9 @@ def checkpoint(path, model, optimizers, config, manifest, step, generator, devic
     os.replace(temporary, path)
 
 
-def train(config_path, data_path, output, requested_device="auto", resume=False, stop_after=None):
+def train(config_path, data_path, output, requested_device="auto", resume=False, stop_after=None, init_from=None):
+    if resume and init_from is not None:
+        raise ValueError("Cannot combine resume and init_from")
     config = read_config(config_path)
     settings = config["train"]
     device = choose_device(requested_device)
@@ -65,6 +106,12 @@ def train(config_path, data_path, output, requested_device="auto", resume=False,
     tokenizer = load_tokenizer(Path(data_path) / "tokenizer")
     if manifest["vocab_size"] > config["model"]["vocab_size"]:
         raise ValueError("Tokenizer vocabulary exceeds model vocabulary")
+    assistant_tokens = None
+    if settings.get("assistant_only", False):
+        assistant_id = tokenizer.convert_tokens_to_ids("<|assistant|>")
+        end_id = tokenizer.convert_tokens_to_ids("<|end|>")
+        non_assistant = {tokenizer.convert_tokens_to_ids(t) for t in ("<|user|>", "<|system|>", "<|eos|>")}
+        assistant_tokens = (assistant_id, end_id, non_assistant)
     precision = resolve_precision(settings.get("precision", "fp32"), device)
     use_compile = settings.get("compile", False)
     autocast_ctx = partial(torch.autocast, device_type=device.type, dtype=torch.bfloat16) if precision == "bf16" else nullcontext
@@ -93,14 +140,22 @@ def train(config_path, data_path, output, requested_device="auto", resume=False,
             torch.mps.set_rng_state(saved["device_rng"])
         start = saved["step"]
     else:
+        if init_from is not None:
+            saved = torch.load(init_from, map_location="cpu", weights_only=True)
+            if saved["config"]["model"] != config["model"]:
+                raise ValueError("init_from requires identical model config")
+            raw_model.load_state_dict(saved["model"])
         output.mkdir(parents=True, exist_ok=False)
         tokenizer.save_pretrained(output / "tokenizer")
         raw_model.config.save_pretrained(output)
-        (output / "experiment.json").write_text(json.dumps({
+        experiment_meta = {
             "config": config, "manifest": manifest,
             "torch": torch.__version__, "device": str(device),
             "precision": precision, "compile": use_compile,
-        }, indent=2) + "\n")
+        }
+        if init_from is not None:
+            experiment_meta["init_from"] = str(init_from)
+        (output / "experiment.json").write_text(json.dumps(experiment_meta, indent=2) + "\n")
     end = min(settings["steps"], stop_after if stop_after is not None else settings["steps"])
     if end <= start:
         raise ValueError("No steps remain before stop-after/total steps")
@@ -119,7 +174,7 @@ def train(config_path, data_path, output, requested_device="auto", resume=False,
                 group["lr"] = group["base_lr"] * scale
         total_loss = 0.0
         for _ in range(settings["gradient_accumulation"]):
-            loss = loss_on(model, *batch(train_tokens, settings, generator, device), autocast_ctx)
+            loss = loss_on(model, *batch(train_tokens, settings, generator, device, assistant_tokens), autocast_ctx)
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Nonfinite loss at step {step + 1}")
             total_loss += loss.item() / settings["gradient_accumulation"]
@@ -130,7 +185,7 @@ def train(config_path, data_path, output, requested_device="auto", resume=False,
         done = step + 1
         record = {"step": done, "train_loss": total_loss, "lr_scale": scale}
         if done % settings["eval_every"] == 0 or done == end:
-            record["validation_loss"] = evaluate(model, validation_tokens, settings, device, autocast_ctx)
+            record["validation_loss"] = evaluate(model, validation_tokens, settings, device, autocast_ctx, assistant_tokens)
         record["elapsed_seconds"] = time.monotonic() - started
         with (output / "metrics.jsonl").open("a") as log:
             log.write(json.dumps(record) + "\n")
@@ -142,9 +197,9 @@ def train(config_path, data_path, output, requested_device="auto", resume=False,
 
 
 @torch.no_grad()
-def sample(run, prompt, requested_device="cpu", max_new_tokens=64, temperature=0.8, seed=42):
-    if max_new_tokens < 1 or temperature < 0:
-        raise ValueError("Use positive max_new_tokens and nonnegative temperature")
+def sample(run, prompt, requested_device="cpu", max_new_tokens=64, temperature=0.8, seed=42, top_k=0, top_p=1.0, raw=False):
+    if max_new_tokens < 1 or temperature < 0 or top_k < 0 or not (0 < top_p <= 1.0):
+        raise ValueError("Use positive max_new_tokens, nonnegative temperature/top_k, and 0 < top_p <= 1")
     device = choose_device(requested_device)
     torch.manual_seed(seed)
     run = Path(run)
@@ -155,7 +210,7 @@ def sample(run, prompt, requested_device="cpu", max_new_tokens=64, temperature=0
         "pad_token_id": tokenizer.pad_token_id,
     }).to(device).eval()
     model.load_state_dict(saved["model"])
-    text = tokenizer.apply_chat_template(
+    text = prompt if raw else tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True,
     )
     inputs = tokenizer(text, return_tensors="pt").to(device)
@@ -163,13 +218,14 @@ def sample(run, prompt, requested_device="cpu", max_new_tokens=64, temperature=0
         raise ValueError("Prompt plus generation exceeds configured context")
     options = {"do_sample": temperature > 0}
     if temperature > 0:
-        options.update(temperature=temperature, top_k=0, top_p=1.0)
+        options.update(temperature=temperature, top_k=top_k, top_p=top_p)
     # A tokenizer may contain fewer tokens than its requested BPE target.
     # Unused model output rows must never be sampled.
     unused = [[index] for index in range(len(tokenizer), model.config.vocab_size)]
+    eos_ids = tokenizer.eos_token_id if raw else [tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids("<|end|>")]
     result = model.generate(
         **inputs, max_new_tokens=max_new_tokens, use_cache=True,
-        eos_token_id=[tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids("<|end|>")],
-        pad_token_id=tokenizer.pad_token_id, bad_words_ids=unused or None, **options,
+        eos_token_id=eos_ids, pad_token_id=tokenizer.pad_token_id, bad_words_ids=unused or None, **options,
     )
-    print(tokenizer.decode(result[0, inputs.input_ids.shape[1]:], skip_special_tokens=True))
+    tokens = result[0] if raw else result[0, inputs.input_ids.shape[1]:]
+    print(tokenizer.decode(tokens, skip_special_tokens=True))

@@ -6,7 +6,7 @@ import torch
 
 from kestrel.core import make_model, make_optimizers, read_config, resolve_precision, wsd
 from kestrel.data import load_tokenizer, prepare, rows, train_tokenizer
-from kestrel.train import sample, train
+from kestrel.train import mask_assistant_targets, sample, train
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -94,6 +94,12 @@ def test_end_to_end_and_exact_cpu_resume(tmp_path, capsys):
     assert metrics[-1]["validation_loss"] > 0
     sample(tmp_path / "full", "hi", max_new_tokens=2, temperature=0)
     assert capsys.readouterr().out
+    sample(tmp_path / "full", "hello", max_new_tokens=2, temperature=0.8, top_k=5, top_p=0.9, raw=True)
+    assert capsys.readouterr().out.startswith("hello")
+    with pytest.raises(ValueError):
+        sample(tmp_path / "full", "hello", top_k=-1)
+    with pytest.raises(ValueError):
+        sample(tmp_path / "full", "hello", top_p=1.5)
 
 
 def test_precision_and_compile_config(tmp_path):
@@ -132,3 +138,47 @@ def test_bf16_train_smoke(tmp_path):
     experiment = json.loads((tmp_path / "run/experiment.json").read_text())
     assert experiment["precision"] == "bf16"
     assert experiment["compile"] is False
+
+
+def test_sft_init_from_and_assistant_masking(tmp_path):
+    training = tmp_path / "train.jsonl"
+    validation = tmp_path / "validation.jsonl"
+    training.write_text("\n".join(json.dumps({"messages": [
+        {"role": "user", "content": f"question {i}"},
+        {"role": "assistant", "content": f"answer {i}"},
+    ]}) for i in range(12)))
+    validation.write_text("\n".join(json.dumps({"messages": [
+        {"role": "user", "content": f"val question {i}"},
+        {"role": "assistant", "content": f"val answer {i}"},
+    ]}) for i in range(4)))
+    tokenizer_path = tmp_path / "tokenizer"
+    train_tokenizer(training, tokenizer_path, 512)
+    tokenizer = load_tokenizer(tokenizer_path)
+    data_path = tmp_path / "encoded"
+    prepare(training, validation, tokenizer_path, data_path)
+
+    # Check assistant-only masking across a boundary starting mid-assistant-turn.
+    rendered_text = tokenizer.apply_chat_template([
+        {"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello world"},
+    ], tokenize=False)
+    ids = tokenizer(rendered_text, add_special_tokens=False)["input_ids"]
+    assistant_id = tokenizer.convert_tokens_to_ids("<|assistant|>")
+    end_id = tokenizer.convert_tokens_to_ids("<|end|>")
+    non_assistant = {tokenizer.convert_tokens_to_ids(t) for t in ("<|user|>", "<|system|>", "<|eos|>")}
+    a_pos = ids.index(assistant_id)
+    tokens = torch.tensor([ids[a_pos + 1:]], dtype=torch.long)
+    y = mask_assistant_targets(ids, [a_pos + 1], tokens, assistant_id, end_id, non_assistant)
+    assert (y[0, :-2] != -100).all()      # assistant content + <|end|> supervised
+    assert (y[0, -2:] == -100).all()     # \n<|eos|> after <|end|> masked
+
+    # Base run then SFT init_from with assistant_only = true.
+    base_cfg = ROOT / "configs/smoke.toml"
+    train(base_cfg, data_path, tmp_path / "base", "cpu", stop_after=2)
+    sft_cfg = tmp_path / "sft.toml"
+    sft_cfg.write_text(base_cfg.read_text() + "assistant_only = true\n")
+    train(sft_cfg, data_path, tmp_path / "sft", "cpu", stop_after=2, init_from=tmp_path / "base/latest.pt")
+    sft_exp = json.loads((tmp_path / "sft/experiment.json").read_text())
+    assert sft_exp["init_from"].endswith("base/latest.pt")
+    assert sft_exp["config"]["train"]["assistant_only"] is True
+    with pytest.raises(ValueError, match="Cannot combine"):
+        train(sft_cfg, data_path, tmp_path / "sft", "cpu", resume=True, init_from=tmp_path / "base/latest.pt")
