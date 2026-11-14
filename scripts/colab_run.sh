@@ -7,7 +7,16 @@ HF_CONFIG="${HF_CONFIG:-sample-10BT}"
 VOCAB_SIZE="${VOCAB_SIZE:-16384}"
 TRAIN_DOCS="${TRAIN_DOCS:-500000}"
 VAL_DOCS="${VAL_DOCS:-5000}"
-DATA_DIR="${DATA_DIR:-/content/kestrel-data}"
+TOKENIZER_DOCS="${TOKENIZER_DOCS:-100000}"
+PREP_ONLY="${PREP_ONLY:-0}"
+
+if [ -z "${DATA_DIR:-}" ]; then
+  if [ -d /content/drive/MyDrive ]; then
+    DATA_DIR="/content/drive/MyDrive/kestrel/data"
+  else
+    DATA_DIR="/content/kestrel-data"
+  fi
+fi
 
 if [ -z "${RUN_DIR:-}" ]; then
   if [ -d /content/drive/MyDrive ]; then
@@ -17,33 +26,39 @@ if [ -z "${RUN_DIR:-}" ]; then
   fi
 fi
 
-export TOKENIZERS_PARALLELISM=false
+export TOKENIZERS_PARALLELISM=true
 
 python -m pip install -q --no-deps -e .
 python -c "import datasets" 2>/dev/null || python -m pip install -q datasets
 
-if [ ! -f "$DATA_DIR/raw/train.jsonl" ] || [ ! -f "$DATA_DIR/raw/validation.jsonl" ]; then
-  python scripts/fetch_hf.py \
-    --dataset "$DATASET" \
-    --config "$HF_CONFIG" \
-    --train-docs "$TRAIN_DOCS" \
-    --val-docs "$VAL_DOCS" \
-    --output "$DATA_DIR/raw"
-fi
-
-if [ ! -f "$DATA_DIR/tokenizer/tokenizer.json" ]; then
-  python -m kestrel tokenizer \
-    --train "$DATA_DIR/raw/train.jsonl" \
-    --output "$DATA_DIR/tokenizer" \
-    --vocab-size "$VOCAB_SIZE"
-fi
-
 if [ ! -f "$DATA_DIR/encoded/manifest.json" ]; then
+  if [ ! -f "$DATA_DIR/raw/train.jsonl" ] || [ ! -f "$DATA_DIR/raw/validation.jsonl" ]; then
+    python scripts/fetch_hf.py \
+      --dataset "$DATASET" \
+      --config "$HF_CONFIG" \
+      --train-docs "$TRAIN_DOCS" \
+      --val-docs "$VAL_DOCS" \
+      --output "$DATA_DIR/raw"
+  fi
+
+  if [ ! -f "$DATA_DIR/tokenizer/tokenizer.json" ]; then
+    head -n "$TOKENIZER_DOCS" "$DATA_DIR/raw/train.jsonl" > /tmp/kestrel_tok_train.jsonl
+    python -m kestrel tokenizer \
+      --train /tmp/kestrel_tok_train.jsonl \
+      --output "$DATA_DIR/tokenizer" \
+      --vocab-size "$VOCAB_SIZE"
+    rm -f /tmp/kestrel_tok_train.jsonl
+  fi
+
   python -m kestrel prepare \
     --train "$DATA_DIR/raw/train.jsonl" \
     --validation "$DATA_DIR/raw/validation.jsonl" \
     --tokenizer "$DATA_DIR/tokenizer" \
     --output "$DATA_DIR/encoded"
+fi
+
+if [ "$PREP_ONLY" = "1" ]; then
+  exit 0
 fi
 
 RESUME_FLAG=()

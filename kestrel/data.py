@@ -105,14 +105,22 @@ def prepare(train, validation, tokenizer_path, destination):
     tokenizer.save_pretrained(destination / "tokenizer")
     metadata = {"vocab_size": len(tokenizer), "splits": {}}
     for split, path in (("train", train), ("validation", validation)):
-        # Stream to disk: no corpus-sized Python token list or RAM allocation.
+        # Stream in batches to disk: fast Rust parallelism without corpus-sized RAM.
         raw = destination / f"{split}.bin"
         count = 0
+        chunk = []
         with raw.open("wb") as output:
             for row in rows(path):
-                ids = tokenizer.encode(rendered(row, tokenizer), add_special_tokens=False)
-                np.asarray(ids, dtype="<u4").tofile(output)
-                count += len(ids)
+                chunk.append(rendered(row, tokenizer))
+                if len(chunk) >= 1024:
+                    for ids in tokenizer(chunk, add_special_tokens=False)["input_ids"]:
+                        np.asarray(ids, dtype="<u4").tofile(output)
+                        count += len(ids)
+                    chunk.clear()
+            if chunk:
+                for ids in tokenizer(chunk, add_special_tokens=False)["input_ids"]:
+                    np.asarray(ids, dtype="<u4").tofile(output)
+                    count += len(ids)
         if not count:
             raise ValueError(f"Empty {split} split")
         metadata["splits"][split] = {
