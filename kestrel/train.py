@@ -212,18 +212,20 @@ def _load_for_inference(run, requested_device, seed):
     return model, tokenizer, device, unused or None
 
 
-def _sampling_options(max_new_tokens, temperature, top_k, top_p):
-    if max_new_tokens < 1 or temperature < 0 or top_k < 0 or not (0 < top_p <= 1.0):
-        raise ValueError("Use positive max_new_tokens, nonnegative temperature/top_k, and 0 < top_p <= 1")
+def _sampling_options(max_new_tokens, temperature, top_k, top_p, repetition_penalty=1.0):
+    if max_new_tokens < 1 or temperature < 0 or top_k < 0 or not (0 < top_p <= 1.0) or repetition_penalty <= 0:
+        raise ValueError("Use positive max_new_tokens/repetition_penalty, nonnegative temperature/top_k, and 0 < top_p <= 1")
     options = {"do_sample": temperature > 0}
+    if repetition_penalty != 1.0:
+        options["repetition_penalty"] = repetition_penalty
     if temperature > 0:
         options.update(temperature=temperature, top_k=top_k, top_p=top_p)
     return options
 
 
 @torch.no_grad()
-def sample(run, prompt, requested_device="cpu", max_new_tokens=64, temperature=0.8, seed=42, top_k=0, top_p=1.0, raw=False):
-    options = _sampling_options(max_new_tokens, temperature, top_k, top_p)
+def sample(run, prompt, requested_device="cpu", max_new_tokens=64, temperature=0.8, seed=42, top_k=0, top_p=1.0, raw=False, repetition_penalty=1.0):
+    options = _sampling_options(max_new_tokens, temperature, top_k, top_p, repetition_penalty)
     model, tokenizer, device, bad_words_ids = _load_for_inference(run, requested_device, seed)
     text = prompt if raw else tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True,
@@ -241,9 +243,9 @@ def sample(run, prompt, requested_device="cpu", max_new_tokens=64, temperature=0
 
 
 @torch.no_grad()
-def chat(run, requested_device="auto", max_new_tokens=256, temperature=0.7, seed=42, top_k=50, top_p=0.9, system=None):
+def chat(run, requested_device="auto", max_new_tokens=256, temperature=0.7, seed=42, top_k=50, top_p=0.9, system=None, repetition_penalty=1.1):
     """Interactive multi-turn chat loop with automatic history trimming."""
-    options = _sampling_options(max_new_tokens, temperature, top_k, top_p)
+    options = _sampling_options(max_new_tokens, temperature, top_k, top_p, repetition_penalty)
     model, tokenizer, device, bad_words_ids = _load_for_inference(run, requested_device, seed)
     eos_ids = [tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids("<|end|>")]
     base_history = [{"role": "system", "content": system}] if system else []

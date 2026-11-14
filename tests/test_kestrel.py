@@ -94,12 +94,14 @@ def test_end_to_end_and_exact_cpu_resume(tmp_path, capsys):
     assert metrics[-1]["validation_loss"] > 0
     sample(tmp_path / "full", "hi", max_new_tokens=2, temperature=0)
     assert capsys.readouterr().out
-    sample(tmp_path / "full", "hello", max_new_tokens=2, temperature=0.8, top_k=5, top_p=0.9, raw=True)
+    sample(tmp_path / "full", "hello", max_new_tokens=2, temperature=0.8, top_k=5, top_p=0.9, repetition_penalty=1.2, raw=True)
     assert capsys.readouterr().out.startswith("hello")
     with pytest.raises(ValueError):
         sample(tmp_path / "full", "hello", top_k=-1)
     with pytest.raises(ValueError):
         sample(tmp_path / "full", "hello", top_p=1.5)
+    with pytest.raises(ValueError):
+        sample(tmp_path / "full", "hello", repetition_penalty=0)
 
 
 def test_chat_loop(tmp_path, monkeypatch, capsys):
@@ -234,3 +236,27 @@ def test_sft_init_from_and_assistant_masking(tmp_path):
     assert sft_exp["config"]["train"]["assistant_only"] is True
     with pytest.raises(ValueError, match="Cannot combine"):
         train(sft_cfg, data_path, tmp_path / "sft", "cpu", resume=True, init_from=tmp_path / "base/latest.pt")
+
+
+def test_titans_repetition_penalty(monkeypatch):
+    from types import SimpleNamespace
+
+    cfg = read_config(ROOT / "configs/titans_smoke.toml")["model"]
+    model = make_model(cfg).eval()
+    base_logits = torch.full((1, 1, cfg["vocab_size"]), -10.0)
+    base_logits[0, 0, 1] = 5.0
+    base_logits[0, 0, 2] = 2.0
+    base_logits[0, 0, 3] = -0.5
+    monkeypatch.setattr(model, "forward", lambda idx: SimpleNamespace(logits=base_logits))
+
+    # Seen positive logit (5.0 on token 1) beats 2.0 without penalty, but 5.0 / 4.0 = 1.25 < 2.0 with penalty=4.0.
+    prompt = torch.tensor([[1, 3]])
+    assert model.generate(prompt, max_new_tokens=1, do_sample=False, repetition_penalty=1.0)[0, -1].item() == 1
+    assert model.generate(prompt, max_new_tokens=1, do_sample=False, repetition_penalty=4.0)[0, -1].item() == 2
+
+    # When only negative logits compete, penalizing a seen negative logit (-0.5 * 4 = -2.0) makes unseen (-1.0) win.
+    neg_logits = torch.full((1, 1, cfg["vocab_size"]), -10.0)
+    neg_logits[0, 0, 3] = -0.5
+    neg_logits[0, 0, 4] = -1.0
+    monkeypatch.setattr(model, "forward", lambda idx: SimpleNamespace(logits=neg_logits))
+    assert model.generate(prompt, max_new_tokens=1, do_sample=False, repetition_penalty=4.0)[0, -1].item() == 4

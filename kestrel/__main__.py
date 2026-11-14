@@ -36,6 +36,7 @@ def main():
     generation.add_argument("--temperature", type=float, default=0.8)
     generation.add_argument("--top-k", type=int, default=0)
     generation.add_argument("--top-p", type=float, default=1.0)
+    generation.add_argument("--repetition-penalty", type=float, default=1.0)
     generation.add_argument("--raw", action="store_true", help="Sample from raw prompt without chat template")
     generation.add_argument("--seed", type=int, default=42)
     interactive = sub.add_parser("chat", help="Interactive multi-turn chat loop")
@@ -45,6 +46,7 @@ def main():
     interactive.add_argument("--temperature", type=float, default=0.7)
     interactive.add_argument("--top-k", type=int, default=50)
     interactive.add_argument("--top-p", type=float, default=0.9)
+    interactive.add_argument("--repetition-penalty", type=float, default=1.1)
     interactive.add_argument("--system")
     interactive.add_argument("--seed", type=int, default=42)
     args = vars(parser.parse_args())
@@ -63,10 +65,11 @@ def main():
         train(args["config"], args["data"], args["output"], args["device"], args["resume"], args["stop_after"], args["init_from"])
     elif command == "sample":
         sample(args["run"], args["prompt"], args["device"], args["max_new_tokens"],
-               args["temperature"], args["seed"], args["top_k"], args["top_p"], args["raw"])
+               args["temperature"], args["seed"], args["top_k"], args["top_p"], args["raw"],
+               args["repetition_penalty"])
     else:
         chat(args["run"], args["device"], args["max_new_tokens"], args["temperature"],
-             args["seed"], args["top_k"], args["top_p"], args["system"])
+             args["seed"], args["top_k"], args["top_p"], args["system"], args["repetition_penalty"])
 
 
 if __name__ == "__main__":

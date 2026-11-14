@@ -189,13 +189,17 @@ class TitansMAGForCausalLM(nn.Module):
 
     @torch.no_grad()
     def generate(self, input_ids, max_new_tokens=64, do_sample=True, temperature=1.0,
-                 top_k=0, top_p=1.0, eos_token_id=None, bad_words_ids=None, **kwargs):
+                 top_k=0, top_p=1.0, repetition_penalty=1.0, eos_token_id=None, bad_words_ids=None, **kwargs):
         stop_ids = set(eos_token_id) if isinstance(eos_token_id, (list, tuple, set)) else ({eos_token_id} if eos_token_id is not None else set())
         bad_ids = [item[0] for item in bad_words_ids] if bad_words_ids else []
         tokens = input_ids
         for _ in range(max_new_tokens):
             ctx = tokens[:, -self.config.max_position_embeddings:]
             logits = self(ctx).logits[:, -1, :]
+            if repetition_penalty != 1.0:
+                score = torch.gather(logits, 1, tokens)
+                score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
+                logits = logits.scatter(1, tokens, score)
             if bad_ids:
                 logits[:, bad_ids] = float("-inf")
             if not do_sample:
