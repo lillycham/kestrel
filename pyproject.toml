@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kestrel-lm"
+version = "0.1.0"
+description = "Small conversational language model experiments"
+requires-python = ">=3.11"
+dependencies = ["torch>=2.9", "transformers>=5.17,<6", "tokenizers>=0.23", "numpy>=2"]
+
+[tool.setuptools.packages.find]
+include = ["kestrel*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

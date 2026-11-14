@@ -1,0 +1,31 @@
+# An initial shape, not the result of a shape search.
+[model]
+vocab_size = 8192
+hidden_size = 256
+intermediate_size = 688
+num_hidden_layers = 8
+num_attention_heads = 8
+num_key_value_heads = 4
+head_dim = 32
+max_position_embeddings = 512
+tie_word_embeddings = true
+attention_bias = false
+attention_dropout = 0.0
+rms_norm_eps = 0.000001
+rope_theta = 10000.0
+
+[train]
+steps = 10000
+batch_size = 4
+sequence_length = 256
+gradient_accumulation = 4
+warmup_steps = 200
+decay_steps = 2000
+muon_lr = 0.02
+adamw_lr = 0.0003
+weight_decay = 0.01
+clip_norm = 1.0
+eval_every = 100
+eval_batches = 8
+save_every = 500
+seed = 42
