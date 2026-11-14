@@ -2,6 +2,8 @@
 
 import argparse
 import json
+import os
+import sys
 from pathlib import Path
 
 from kestrel.data import SPECIAL
@@ -58,6 +60,8 @@ def main():
         "skipped": skipped,
         "output": str(out),
     }))
+    sys.stdout.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":
