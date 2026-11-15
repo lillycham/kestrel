@@ -49,8 +49,49 @@ def main():
     interactive.add_argument("--repetition-penalty", type=float, default=1.1)
     interactive.add_argument("--system")
     interactive.add_argument("--seed", type=int, default=42)
+    rl = sub.add_parser("grpo", help="GRPO on step-by-step arithmetic from a trained run")
+    rl.add_argument("--init-from", help="Run directory to start from (not needed with --resume)")
+    rl.add_argument("--output", required=True)
+    rl.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
+    rl.add_argument("--resume", action="store_true")
+    rl.add_argument("--steps", type=int, default=200)
+    rl.add_argument("--prompts", type=int, default=16, help="Problems per step")
+    rl.add_argument("--group", type=int, default=8, help="Samples per problem")
+    rl.add_argument("--temperature", type=float, default=1.0)
+    rl.add_argument("--max-new-tokens", type=int, default=80)
+    rl.add_argument("--lr", type=float, default=1e-5)
+    rl.add_argument("--warmup", type=int, default=10)
+    rl.add_argument("--clip", type=float, default=1.0)
+    rl.add_argument("--max-rows", type=int, default=128, help="Rows per generate batch")
+    rl.add_argument("--micro-rows", type=int, default=16, help="Rows per backward pass")
+    rl.add_argument("--eval-every", type=int, default=25)
+    rl.add_argument("--eval-problems", type=int, default=16, help="Eval problems per bucket")
+    rl.add_argument("--eval-group", type=int, default=4, help="Samples per eval problem for sampled pass@1")
+    rl.add_argument("--save-every", type=int, default=25)
+    rl.add_argument("--seen-from", help="Pretraining JSONL; keep its problems out of the eval set")
+    rl.add_argument("--weights", help='Bucket weights as JSON, e.g. \'{"sub_borrow": 1}\'')
+    rl.add_argument("--seed", type=int, default=0)
     args = vars(parser.parse_args())
     command = args.pop("command")
+    if command == "grpo":
+        from .grpo import DEFAULT_WEIGHTS, grpo
+
+        positive = ("steps", "prompts", "group", "max_new_tokens", "max_rows", "micro_rows",
+                    "eval_every", "eval_problems", "eval_group", "save_every")
+        if any(args[k] < 1 for k in positive) or args["lr"] <= 0 or args["clip"] <= 0 or args["temperature"] <= 0:
+            parser.error("GRPO sizes, lr, clip and temperature must be positive")
+        if args["group"] < 2:
+            parser.error("GRPO needs --group of at least 2")
+        if not args["resume"] and not args["init_from"]:
+            parser.error("--init-from is required unless --resume is given")
+        weights = json.loads(args["weights"]) if args["weights"] else DEFAULT_WEIGHTS
+        unknown = set(weights) - set(DEFAULT_WEIGHTS)
+        if unknown or not weights or min(weights.values()) < 0 or sum(weights.values()) <= 0:
+            parser.error(f"Weights need known buckets and nonnegative values: {sorted(unknown)}")
+        settings = {k: args[k] for k in (*positive, "temperature", "lr", "warmup", "clip", "seen_from", "seed")}
+        settings["weights"] = weights
+        grpo(args["init_from"], args["output"], settings, args["device"], args["resume"])
+        return
     if command == "inspect":
         model = make_model(read_config(args["config"])["model"])
         total = sum(p.numel() for p in model.parameters())

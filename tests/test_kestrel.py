@@ -366,3 +366,87 @@ def test_titans_group_sampling_and_logprobs():
         assert torch.equal(new[row, :end], sampled[row, prompt.shape[1]:prompt.shape[1] + end])
         assert (new[row, end:] == 0).all() and (lp2[row, end:] == 0).all()
     assert new.shape[1] <= 20 and (new[0, 3:] == 0).all()
+
+
+def test_arith_problems_round_trip():
+    import random as pyrandom
+    from kestrel.arith import BUCKETS, bucket, draw, is_correct, parse, render
+
+    rng = pyrandom.Random(0)
+    for name in BUCKETS:
+        for _ in range(50):
+            problem = draw(name, rng)
+            assert bucket(problem) == name
+            assert parse(render(problem)[0]) == problem
+    problem = ("sub", (127, 86))
+    assert is_correct("First subtract 80: 127 - 80 = 47.\nThen subtract 6: 47 - 6 = 41.\nAnswer: 41", problem)
+    assert not is_correct("Answer: 3", problem) and not is_correct("no answer", problem)
+
+
+def _arith_run(tmp_path):
+    """Train the Titans smoke model for a few steps on arithmetic text and return its run directory."""
+    import random as pyrandom
+    from kestrel.arith import BUCKETS, draw, render
+
+    rng = pyrandom.Random(0)
+    docs = []
+    for i in range(60):
+        line, answer = render(draw(list(BUCKETS)[i % len(BUCKETS)], rng))
+        docs.append(json.dumps({"text": f"{line}\nAnswer: {answer}"}))
+    training, validation = tmp_path / "train.jsonl", tmp_path / "validation.jsonl"
+    training.write_text("\n".join(docs[:48]))
+    validation.write_text("\n".join(docs[48:]))
+    train_tokenizer(training, tmp_path / "tokenizer", 512)
+    prepare(training, validation, tmp_path / "tokenizer", tmp_path / "encoded")
+    train(ROOT / "configs/titans_smoke.toml", tmp_path / "encoded", tmp_path / "base", "cpu")
+    return tmp_path / "base"
+
+
+def test_grpo_step_direction_and_logprob_agreement(tmp_path):
+    from kestrel.grpo import completion_mask, policy_loss, rollout
+    from kestrel.train import _load_for_inference
+
+    assert completion_mask(torch.tensor([[5, 2, 0, 0], [5, 6, 7, 8]]), 2).tolist() == [[True, True, False, False], [True] * 4]
+    model, tokenizer, _, bad = _load_for_inference(_arith_run(tmp_path), "cpu", 0)
+    problems = [("sub", (127, 86)), ("mul", (14, 8)), ("add", (47, 38))]
+    groups = rollout(model, tokenizer, problems, group=4, temperature=1.0, max_new_tokens=12, max_rows=8, bad_words_ids=bad)
+    assert [g["problem"] for g in groups] == problems
+    # Pretend the first sample of each group is right, so every group has a nonzero advantage.
+    for g in groups:
+        g["rewards"] = torch.tensor([1.0, 0.0, 0.0, 0.0])
+    before = _completion_logprob(model, groups[0], 0)
+    stats = policy_loss(model, groups, tokenizer.pad_token_id, normaliser=1.0, micro_rows=5)
+    assert stats["rows"] == 12 and stats["logprob_gap"] < 1e-4
+    with torch.no_grad():
+        for p in model.parameters():
+            if p.grad is not None:
+                p -= 1e-3 * p.grad
+    assert _completion_logprob(model, groups[0], 0) > before
+
+
+def _completion_logprob(model, g, row):
+    n = len(g["prompt"])
+    ids = torch.cat([g["prompt"], g["completions"][row]])[None]
+    with torch.no_grad():
+        logp = model(ids).logits[0, :-1].log_softmax(-1).gather(1, ids[0, 1:, None]).squeeze(1)
+    return (logp[n - 1:] * g["mask"][row]).sum().item()
+
+
+def test_grpo_run_and_resume(tmp_path):
+    from kestrel.grpo import DEFAULT_WEIGHTS, grpo
+
+    base = _arith_run(tmp_path)
+    settings = {"steps": 2, "prompts": 3, "group": 2, "max_new_tokens": 8, "max_rows": 8, "micro_rows": 4,
+                "eval_every": 2, "eval_problems": 1, "eval_group": 2, "save_every": 1, "temperature": 1.0,
+                "lr": 1e-4, "warmup": 1, "clip": 1.0, "seen_from": None, "seed": 0, "weights": DEFAULT_WEIGHTS}
+    grpo(base, tmp_path / "rl", settings, "cpu")
+    records = [json.loads(line) for line in (tmp_path / "rl/metrics.jsonl").read_text().splitlines()]
+    assert [r["step"] for r in records] == [0, 1, 2] and "eval_greedy" in records[-1]
+    with pytest.raises(ValueError):
+        grpo(None, tmp_path / "rl", {**settings, "lr": 1.0}, "cpu", resume=True)
+    with pytest.raises(ValueError):
+        grpo(None, tmp_path / "rl", settings, "cpu", resume=True)
+    grpo(None, tmp_path / "rl", {**settings, "steps": 3}, "cpu", resume=True)
+    records = [json.loads(line) for line in (tmp_path / "rl/metrics.jsonl").read_text().splitlines()]
+    assert [r["step"] for r in records] == [0, 1, 2, 3]
+    sample(tmp_path / "rl", "Compute 1 + 2 step by step.", "cpu", max_new_tokens=4, raw=True)
