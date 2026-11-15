@@ -334,3 +334,35 @@ def test_titans_cached_decode_matches_full_forward(looped):
             model.generate(prompt, max_new_tokens=20, do_sample=False, use_cache=True),
             model.generate(prompt, max_new_tokens=20, do_sample=False, use_cache=False),
         )
+
+
+def test_titans_group_sampling_and_logprobs():
+    cfg = dict(read_config(ROOT / "configs/titans_smoke.toml")["model"])
+    cfg.update(memory_hidden_size=32, memory_heads=4, num_hidden_layers=1, prelude_layers=1, num_loops=2, coda_layers=1)
+    torch.manual_seed(0)
+    model = make_model(cfg).eval()
+    prompt = torch.randint(10, 500, (1, 6))
+    single = model.generate(prompt, max_new_tokens=20, do_sample=False)
+    group, logprobs = model.generate(prompt, max_new_tokens=20, do_sample=False, num_return_sequences=3, return_logprobs=True)
+    assert torch.equal(group, single.repeat(3, 1))
+    assert torch.equal(group, model.generate(prompt, max_new_tokens=20, do_sample=False, num_return_sequences=3, use_cache=False))
+    # Logprobs agree with a full forward over the generated sequence.
+    with torch.no_grad():
+        full = model(group).logits.log_softmax(-1)[:, prompt.shape[1] - 1:-1]
+    torch.testing.assert_close(logprobs, full.gather(2, group[:, prompt.shape[1]:, None]).squeeze(2), rtol=1e-4, atol=1e-4)
+
+    # Rows stop on their own stop token; finished rows get padding.
+    torch.manual_seed(1)
+    sampled, lp = model.generate(prompt, max_new_tokens=20, do_sample=True, temperature=1.5,
+                                 num_return_sequences=8, return_logprobs=True)
+    stop = sampled[0, prompt.shape[1] + 2].item()
+    torch.manual_seed(1)
+    stopped, lp2 = model.generate(prompt, max_new_tokens=20, do_sample=True, temperature=1.5,
+                                  num_return_sequences=8, return_logprobs=True, eos_token_id=stop, pad_token_id=0)
+    new = stopped[:, prompt.shape[1]:]
+    for row in range(8):
+        hits = (sampled[row, prompt.shape[1]:] == stop).nonzero()
+        end = hits[0].item() + 1 if len(hits) else new.shape[1]
+        assert torch.equal(new[row, :end], sampled[row, prompt.shape[1]:prompt.shape[1] + end])
+        assert (new[row, end:] == 0).all() and (lp2[row, end:] == 0).all()
+    assert new.shape[1] <= 20 and (new[0, 3:] == 0).all()

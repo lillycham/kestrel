@@ -319,7 +319,7 @@ class TitansMAGForCausalLM(nn.Module):
     @torch.no_grad()
     def generate(self, input_ids, max_new_tokens=64, do_sample=True, temperature=1.0,
                  top_k=0, top_p=1.0, repetition_penalty=1.0, eos_token_id=None, bad_words_ids=None,
-                 use_cache=True, **kwargs):
+                 use_cache=True, num_return_sequences=1, return_logprobs=False, pad_token_id=None, **kwargs):
         """Sample new tokens.
 
         With use_cache, the prompt runs once and each step then feeds only the
@@ -327,18 +327,43 @@ class TitansMAGForCausalLM(nn.Module):
         sequence fits in max_position_embeddings. After that, the cached path
         keeps streaming (attention is local and RoPE is relative), but the
         uncached path drops the oldest tokens and recomputes the memory.
+
+        num_return_sequences samples a group of continuations of one prompt
+        (input_ids must have batch size 1). The prompt runs once and its cache
+        is copied for each row. All rows stay at the same position, so their
+        memory chunks complete on the same step. A row stops at a stop token;
+        after that it gets pad_token_id (or the first stop token) until all
+        rows stop.
+
+        With return_logprobs, the result is (tokens, logprobs). logprobs has one
+        value per new token: the log-probability of that token under the raw
+        model distribution (temperature 1, no top-k, top-p or penalty). It is
+        0 for padding after a row stops.
         """
-        stop_ids = set(eos_token_id) if isinstance(eos_token_id, (list, tuple, set)) else ({eos_token_id} if eos_token_id is not None else set())
+        stop_list = list(eos_token_id) if isinstance(eos_token_id, (list, tuple, set)) else ([eos_token_id] if eos_token_id is not None else [])
         bad_ids = [item[0] for item in bad_words_ids] if bad_words_ids else []
-        tokens = input_ids
+        group = num_return_sequences
+        if group > 1 and input_ids.shape[0] != 1:
+            raise ValueError("num_return_sequences > 1 needs a batch of one prompt")
+        fill = pad_token_id if pad_token_id is not None else (stop_list[0] if stop_list else 0)
+        stop_ids = torch.tensor(stop_list, device=input_ids.device, dtype=input_ids.dtype)
         max_ctx = self.config.max_position_embeddings
         cache = {} if use_cache else None
+        tokens = input_ids
+        if cache is not None:
+            logits = self(tokens[:, -max_ctx:], cache=cache, logits_to_keep=1).logits[:, -1, :]
+            if group > 1:
+                cache = _repeat_batch(cache, group)
+                logits = logits.repeat(group, 1)
+        tokens = tokens.repeat(group, 1)
+        finished = torch.zeros(tokens.shape[0], dtype=torch.bool, device=tokens.device)
+        logprobs = []
         for step in range(max_new_tokens):
             if cache is None:
                 logits = self(tokens[:, -max_ctx:]).logits[:, -1, :]
-            else:
-                ctx = tokens[:, -max_ctx:] if step == 0 else tokens[:, -1:]
-                logits = self(ctx, cache=cache, logits_to_keep=1).logits[:, -1, :]
+            elif step > 0:
+                logits = self(tokens[:, -1:], cache=cache, logits_to_keep=1).logits[:, -1, :]
+            raw = logits.float().log_softmax(dim=-1) if return_logprobs else None
             if repetition_penalty != 1.0:
                 score = torch.gather(logits, 1, tokens)
                 score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
@@ -359,7 +384,29 @@ class TitansMAGForCausalLM(nn.Module):
                     sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
                     logits = logits.scatter(1, sorted_idx, sorted_logits)
                 next_tok = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
+            next_tok = next_tok.masked_fill(finished[:, None], fill)
+            if return_logprobs:
+                logprobs.append(raw.gather(1, next_tok).squeeze(1).masked_fill(finished, 0.0))
             tokens = torch.cat([tokens, next_tok], dim=-1)
-            if next_tok.item() in stop_ids:
+            finished = finished | torch.isin(next_tok[:, 0], stop_ids)
+            if bool(finished.all()):
                 break
+        if return_logprobs:
+            empty = tokens.new_zeros(tokens.shape[0], 0, dtype=torch.float32)
+            return tokens, torch.stack(logprobs, dim=1) if logprobs else empty
         return tokens
+
+
+def _repeat_batch(cache, n):
+    """Copy a batch-1 decode cache n times along the batch dimension.
+
+    Memory tensors use a (batch * heads) leading dimension in batch-major order,
+    so tiling a batch-1 cache with repeat gives the right layout for both kinds.
+    """
+    if isinstance(cache, torch.Tensor):
+        return cache.repeat(n, *([1] * (cache.ndim - 1)))
+    if isinstance(cache, dict):
+        return {key: _repeat_batch(value, n) for key, value in cache.items()}
+    if isinstance(cache, (list, tuple)):
+        return type(cache)(_repeat_batch(value, n) for value in cache)
+    return cache
