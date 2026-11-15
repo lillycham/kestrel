@@ -260,3 +260,50 @@ def test_titans_repetition_penalty(monkeypatch):
     neg_logits[0, 0, 4] = -1.0
     monkeypatch.setattr(model, "forward", lambda idx: SimpleNamespace(logits=neg_logits))
     assert model.generate(prompt, max_new_tokens=1, do_sample=False, repetition_penalty=4.0)[0, -1].item() == 4
+
+
+def test_looped_titans_mag_and_checkpoint_archive(tmp_path):
+    base_titans = (ROOT / "configs/titans_smoke.toml").read_text()
+    loop_cfg_path = tmp_path / "loop.toml"
+    loop_cfg_path.write_text(
+        base_titans
+        .replace("memory_hidden_size = 16", "memory_hidden_size = 32\nmemory_heads = 4\nmemory_forget_bias = 0.0\nmemory_min_forget = 0.05\nnorm_attn_branch = true")
+        .replace("num_hidden_layers = 2", "num_hidden_layers = 1\nprelude_layers = 1\nnum_loops = 3\ncoda_layers = 1")
+        .replace("save_every = 2", "save_every = 2\nkeep_checkpoints = true")
+    )
+    cfg = read_config(loop_cfg_path)
+    model = make_model(cfg["model"]).eval()
+    assert hasattr(model, "prelude") and hasattr(model, "coda") and model.loop_embed.shape == (3, 1, cfg["model"]["hidden_size"])
+
+    muon, adam = make_optimizers(model, cfg["train"])
+    ids = [id(p) for o in (muon, adam) for g in o.param_groups for p in g["params"]]
+    assert len(ids) == len(set(ids)) == len(list(model.parameters()))
+    adam_ids = {id(p) for g in adam.param_groups for p in g["params"]}
+    assert id(model.loop_embed) in adam_ids
+
+    # Token-level causality across multiple 4-token chunks with 4 memory heads + 3 depth loops.
+    x = torch.randint(10, 100, (1, 10))
+    y = x.clone()
+    y[:, 5:] = torch.randint(100, 200, (1, 5))
+    with torch.no_grad():
+        torch.testing.assert_close(model(x).logits[:, :5], model(y).logits[:, :5])
+
+    training = tmp_path / "train.jsonl"
+    validation = tmp_path / "validation.jsonl"
+    training.write_text("\n".join(json.dumps({"text": f"looped document {i} " * 8}) for i in range(12)))
+    validation.write_text("\n".join(json.dumps({"text": f"looped val {i} " * 8}) for i in range(4)))
+    tokenizer_path = tmp_path / "tokenizer"
+    train_tokenizer(training, tokenizer_path, 512)
+    data_path = tmp_path / "encoded"
+    prepare(training, validation, tokenizer_path, data_path)
+    train(loop_cfg_path, data_path, tmp_path / "loop_run", "cpu")
+    assert (tmp_path / "loop_run/latest.pt").exists()
+    assert (tmp_path / "loop_run/step_000002.pt").exists()
+    assert (tmp_path / "loop_run/step_000004.pt").exists()
+    sample(tmp_path / "loop_run", "looped", max_new_tokens=4, temperature=0, repetition_penalty=1.2, raw=True)
+
+    # Validation checks on bad Titans/loop options.
+    bad_cfg = read_config(ROOT / "configs/smoke.toml")
+    bad_cfg["model"]["num_loops"] = 2
+    with pytest.raises(ValueError, match="require memory_chunk_size"):
+        make_model(bad_cfg["model"])

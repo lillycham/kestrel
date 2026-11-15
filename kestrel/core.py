@@ -22,6 +22,8 @@ def read_config(path):
         "max_position_embeddings", "tie_word_embeddings", "attention_bias",
         "attention_dropout", "rms_norm_eps", "rope_theta",
         "memory_chunk_size", "memory_hidden_size", "attention_window",
+        "memory_heads", "memory_forget_bias", "memory_min_forget", "norm_attn_branch",
+        "num_loops", "prelude_layers", "coda_layers",
     }
     if set(model) - allowed_model:
         raise ValueError(f"Unknown model options: {set(model) - allowed_model}")
@@ -30,12 +32,12 @@ def read_config(path):
         "warmup_steps", "decay_steps", "muon_lr", "adamw_lr", "weight_decay",
         "clip_norm", "eval_every", "eval_batches", "save_every", "seed",
     }
-    optional_train = {"precision", "compile", "assistant_only"}
+    optional_train = {"precision", "compile", "assistant_only", "keep_checkpoints"}
     if set(train) - (required_train | optional_train) or required_train - set(train):
         raise ValueError(f"Train options differ: {set(train) ^ required_train}")
     if "precision" in train and train["precision"] not in {"fp32", "bf16", "auto"}:
         raise ValueError("precision must be 'fp32', 'bf16' or 'auto'")
-    for flag in ("compile", "assistant_only"):
+    for flag in ("compile", "assistant_only", "keep_checkpoints"):
         if flag in train and not isinstance(train[flag], bool):
             raise ValueError(f"{flag} must be a boolean")
     for name in ("steps", "batch_size", "sequence_length", "gradient_accumulation",
@@ -62,6 +64,12 @@ def make_model(settings, special_ids=None):
     memory_chunk = settings.pop("memory_chunk_size", None)
     memory_hidden = settings.pop("memory_hidden_size", None)
     attention_window = settings.pop("attention_window", None)
+    extra_titans = {
+        key: settings.pop(key) for key in (
+            "memory_heads", "memory_forget_bias", "memory_min_forget",
+            "norm_attn_branch", "num_loops", "prelude_layers", "coda_layers",
+        ) if key in settings
+    }
     width = settings["hidden_size"]
     heads = settings["num_attention_heads"]
     kv_heads = settings["num_key_value_heads"]
@@ -78,10 +86,29 @@ def make_model(settings, special_ids=None):
     if memory_chunk is not None or memory_hidden is not None or attention_window is not None:
         if min(memory_chunk or 0, memory_hidden or 0, attention_window or 0) <= 0:
             raise ValueError("Titans-MAG requires positive memory_chunk_size, memory_hidden_size, and attention_window")
+        mem_heads = extra_titans.get("memory_heads", 1)
+        forget_bias = extra_titans.get("memory_forget_bias", -2.0)
+        min_forget = extra_titans.get("memory_min_forget", 0.0)
+        norm_attn = extra_titans.get("norm_attn_branch", False)
+        num_loops = extra_titans.get("num_loops", 1)
+        prelude_layers = extra_titans.get("prelude_layers", 0)
+        coda_layers = extra_titans.get("coda_layers", 0)
+        if not isinstance(mem_heads, int) or mem_heads <= 0 or width % mem_heads or memory_hidden % mem_heads:
+            raise ValueError("memory_heads must be a positive integer dividing hidden_size and memory_hidden_size")
+        if not math.isfinite(forget_bias) or not (0.0 <= min_forget < 1.0):
+            raise ValueError("memory_forget_bias must be finite and 0 <= memory_min_forget < 1")
+        if not isinstance(norm_attn, bool):
+            raise ValueError("norm_attn_branch must be a boolean")
+        if not isinstance(num_loops, int) or num_loops < 1 or not isinstance(prelude_layers, int) or prelude_layers < 0 or not isinstance(coda_layers, int) or coda_layers < 0:
+            raise ValueError("num_loops >= 1 and prelude_layers/coda_layers >= 0 must be integers")
         config.memory_chunk_size = memory_chunk
         config.memory_hidden_size = memory_hidden
         config.attention_window = attention_window
+        for key, value in extra_titans.items():
+            setattr(config, key, value)
         return TitansMAGForCausalLM(config)
+    if extra_titans:
+        raise ValueError("Looped and memory options require memory_chunk_size, memory_hidden_size, and attention_window")
     config._attn_implementation = "sdpa"
     return Qwen3ForCausalLM(config)
 

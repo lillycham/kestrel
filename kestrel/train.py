@@ -4,6 +4,7 @@ from contextlib import nullcontext
 from functools import partial
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -193,6 +194,11 @@ def train(config_path, data_path, output, requested_device="auto", resume=False,
             print(json.dumps(record), flush=True)
         if done % settings["save_every"] == 0 or done == end:
             checkpoint(output / "latest.pt", raw_model, optimizers, config, manifest, done, generator, device)
+            if settings.get("keep_checkpoints", False):
+                snapshot = output / f"step_{done:06d}.pt"
+                temp_snapshot = snapshot.with_suffix(".tmp")
+                shutil.copyfile(output / "latest.pt", temp_snapshot)
+                os.replace(temp_snapshot, snapshot)
     return raw_model
 
 

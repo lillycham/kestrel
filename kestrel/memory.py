@@ -18,21 +18,33 @@ def _silu_and_grad(x):
 class NeuralMemory(nn.Module):
     """Two-layer fast-weight MLP memory updated per chunk via closed-form MSE gradients."""
 
-    def __init__(self, hidden_size, memory_hidden_size, chunk_size):
+    def __init__(self, hidden_size, memory_hidden_size, chunk_size, heads=1, forget_bias=-2.0, min_forget=0.0):
         super().__init__()
         self.hidden_size = hidden_size
         self.memory_hidden_size = memory_hidden_size
         self.chunk_size = chunk_size
+        self.heads = heads
+        self.head_dim = hidden_size // heads
+        self.mem_head_dim = memory_hidden_size // heads
+        self.forget_bias = forget_bias
+        self.min_forget = min_forget
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        # Per-chunk scalar gates: alpha (forget), eta (momentum), theta (inner lr).
-        self.gate_proj = nn.Linear(hidden_size, 3, bias=False)
-        self.w1_init = nn.Parameter(torch.empty(memory_hidden_size, hidden_size))
-        self.w2_init = nn.Parameter(torch.empty(hidden_size, memory_hidden_size))
-        nn.init.normal_(self.w1_init, std=hidden_size ** -0.5)
-        nn.init.normal_(self.w2_init, std=memory_hidden_size ** -0.5)
+        # Per-head, per-chunk scalar gates: alpha (forget), eta (momentum), theta (inner lr).
+        self.gate_proj = nn.Linear(hidden_size, 3 * heads, bias=False)
+        init_shape_w1 = (memory_hidden_size, hidden_size) if heads == 1 else (heads, self.mem_head_dim, self.head_dim)
+        init_shape_w2 = (hidden_size, memory_hidden_size) if heads == 1 else (heads, self.head_dim, self.mem_head_dim)
+        self.w1_init = nn.Parameter(torch.empty(*init_shape_w1))
+        self.w2_init = nn.Parameter(torch.empty(*init_shape_w2))
+        nn.init.normal_(self.w1_init, std=self.head_dim ** -0.5)
+        nn.init.normal_(self.w2_init, std=self.mem_head_dim ** -0.5)
+
+    def _project_qkv(self, proj, x, bsz, num_chunks):
+        h = proj(x).view(bsz, num_chunks, self.chunk_size, self.heads, self.head_dim)
+        h = F.normalize(h, dim=-1).permute(0, 3, 1, 2, 4).contiguous()
+        return h.view(bsz * self.heads, num_chunks, self.chunk_size, self.head_dim).float()
 
     def forward(self, x):
         bsz, seq_len, dim = x.shape
@@ -43,25 +55,28 @@ class NeuralMemory(nn.Module):
         padded_len = x.shape[1]
         num_chunks = padded_len // c
 
-        q = F.normalize(self.q_proj(x), dim=-1).view(bsz, num_chunks, c, dim).float()
-        k = F.normalize(self.k_proj(x), dim=-1).view(bsz, num_chunks, c, dim).float()
-        v = F.normalize(self.v_proj(x), dim=-1).view(bsz, num_chunks, c, dim).float()
-        # Average chunk hidden state drives scalar forget/momentum/lr gates.
+        q = self._project_qkv(self.q_proj, x, bsz, num_chunks)
+        k = self._project_qkv(self.k_proj, x, bsz, num_chunks)
+        v = self._project_qkv(self.v_proj, x, bsz, num_chunks)
+        # Average chunk hidden state drives scalar forget/momentum/lr gates per head.
         chunk_ctx = x.view(bsz, num_chunks, c, dim).mean(dim=2)
-        gates = self.gate_proj(chunk_ctx).float()
-        alpha = torch.sigmoid(gates[..., 0] - 2.0)[..., None, None]  # conservative forgetting
+        gates = self.gate_proj(chunk_ctx).view(bsz, num_chunks, self.heads, 3).permute(0, 2, 1, 3).contiguous()
+        gates = gates.view(bsz * self.heads, num_chunks, 3).float()
+        alpha = (self.min_forget + (1.0 - self.min_forget) * torch.sigmoid(gates[..., 0] + self.forget_bias))[..., None, None]
         eta = torch.sigmoid(gates[..., 1])[..., None, None]
         theta = 0.05 * torch.sigmoid(gates[..., 2])[..., None, None]
 
-        w1 = self.w1_init.float().unsqueeze(0).expand(bsz, -1, -1).clone()
-        w2 = self.w2_init.float().unsqueeze(0).expand(bsz, -1, -1).clone()
+        w1_base = self.w1_init.unsqueeze(0) if self.heads == 1 else self.w1_init
+        w2_base = self.w2_init.unsqueeze(0) if self.heads == 1 else self.w2_init
+        w1 = w1_base.float().unsqueeze(0).expand(bsz, -1, -1, -1).reshape(bsz * self.heads, self.mem_head_dim, self.head_dim).clone()
+        w2 = w2_base.float().unsqueeze(0).expand(bsz, -1, -1, -1).reshape(bsz * self.heads, self.head_dim, self.mem_head_dim).clone()
         s1 = torch.zeros_like(w1)
         s2 = torch.zeros_like(w2)
 
         outputs = []
         inv_c = 1.0 / c
         for idx in range(num_chunks):
-            qc = q[:, idx]  # (B, C, D)
+            qc = q[:, idx]  # (B * H, C, d_h)
             kc = k[:, idx]
             vc = v[:, idx]
 
@@ -70,14 +85,14 @@ class NeuralMemory(nn.Module):
             outputs.append(torch.bmm(F.silu(hq), w2.transpose(1, 2)))
 
             # Closed-form gradient of 0.5 / C * ||M(kc) - vc||^2 wrt w1, w2.
-            hk = torch.bmm(kc, w1.transpose(1, 2))  # (B, C, M)
+            hk = torch.bmm(kc, w1.transpose(1, 2))  # (B * H, C, m_h)
             ak, dsilu = _silu_and_grad(hk)
             pred = torch.bmm(ak, w2.transpose(1, 2))
-            err = (pred - vc) * inv_c  # (B, C, D)
+            err = (pred - vc) * inv_c  # (B * H, C, d_h)
 
-            gw2 = torch.bmm(err.transpose(1, 2), ak)  # (B, D, M)
-            dak = torch.bmm(err, w2) * dsilu          # (B, C, M)
-            gw1 = torch.bmm(dak.transpose(1, 2), kc)  # (B, M, D)
+            gw2 = torch.bmm(err.transpose(1, 2), ak)  # (B * H, d_h, m_h)
+            dak = torch.bmm(err, w2) * dsilu          # (B * H, C, m_h)
+            gw1 = torch.bmm(dak.transpose(1, 2), kc)  # (B * H, m_h, d_h)
 
             a_i = alpha[:, idx]
             e_i = eta[:, idx]
@@ -87,7 +102,8 @@ class NeuralMemory(nn.Module):
             w1 = (1.0 - a_i) * w1 + s1
             w2 = (1.0 - a_i) * w2 + s2
 
-        out = torch.cat(outputs, dim=1)[:, :seq_len].to(x.dtype)
+        out = torch.cat(outputs, dim=1).view(bsz, self.heads, padded_len, self.head_dim)
+        out = out.permute(0, 2, 1, 3).contiguous().view(bsz, padded_len, dim)[:, :seq_len].to(x.dtype)
         return self.out_proj(out)
 
 
@@ -136,7 +152,13 @@ class TitansMAGBlock(nn.Module):
         super().__init__()
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.self_attn = SlidingWindowAttention(config)
-        self.memory = NeuralMemory(config.hidden_size, config.memory_hidden_size, config.memory_chunk_size)
+        self.attn_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps) if getattr(config, "norm_attn_branch", False) else nn.Identity()
+        self.memory = NeuralMemory(
+            config.hidden_size, config.memory_hidden_size, config.memory_chunk_size,
+            heads=getattr(config, "memory_heads", 1),
+            forget_bias=getattr(config, "memory_forget_bias", -2.0),
+            min_forget=getattr(config, "memory_min_forget", 0.0),
+        )
         self.mem_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mag_gate = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -144,7 +166,7 @@ class TitansMAGBlock(nn.Module):
 
     def forward(self, x, cos, sin):
         h = self.input_layernorm(x)
-        attn_out = self.self_attn(h, cos, sin)
+        attn_out = self.attn_norm(self.self_attn(h, cos, sin))
         mem_out = self.mem_norm(self.memory(h))
         gate = torch.sigmoid(self.mag_gate(h))
         x = x + (1.0 - gate) * attn_out + gate * mem_out
@@ -153,17 +175,31 @@ class TitansMAGBlock(nn.Module):
 
 
 class TitansMAGForCausalLM(nn.Module):
-    """Titans-MAG causal LM compatible with Kestrel's trainer, optimizers, and sampler."""
+    """Titans-MAG causal LM with optional prelude/coda and looped recurrent core."""
 
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.num_loops = getattr(config, "num_loops", 1)
+        prelude_layers = getattr(config, "prelude_layers", 0)
+        coda_layers = getattr(config, "coda_layers", 0)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=getattr(config, "pad_token_id", None))
+        if prelude_layers:
+            self.prelude = nn.ModuleList([TitansMAGBlock(config) for _ in range(prelude_layers)])
         self.layers = nn.ModuleList([TitansMAGBlock(config) for _ in range(config.num_hidden_layers)])
+        if self.num_loops > 1:
+            self.loop_x0_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.loop_inject = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+            # 3D step embedding stays in AdamW (no_decay) rather than Muon.
+            self.loop_embed = nn.Parameter(torch.empty(self.num_loops, 1, config.hidden_size))
+        if coda_layers:
+            self.coda = nn.ModuleList([TitansMAGBlock(config) for _ in range(coda_layers)])
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.apply(self._init_weights)
+        if self.num_loops > 1:
+            nn.init.normal_(self.loop_embed, mean=0.0, std=0.02)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
 
@@ -182,8 +218,21 @@ class TitansMAGForCausalLM(nn.Module):
         x = self.embed_tokens(input_ids)
         pos_ids = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
         cos, sin = self.rotary_emb(x, pos_ids)
-        for layer in self.layers:
-            x = layer(x, cos, sin)
+        if hasattr(self, "prelude"):
+            for layer in self.prelude:
+                x = layer(x, cos, sin)
+        if self.num_loops > 1:
+            x0_normed = self.loop_x0_norm(x)
+            for loop_idx in range(self.num_loops):
+                x = x + self.loop_inject(x0_normed) + self.loop_embed[loop_idx]
+                for layer in self.layers:
+                    x = layer(x, cos, sin)
+        else:
+            for layer in self.layers:
+                x = layer(x, cos, sin)
+        if hasattr(self, "coda"):
+            for layer in self.coda:
+                x = layer(x, cos, sin)
         logits = self.lm_head(self.norm(x))
         return SimpleNamespace(logits=logits)
 
