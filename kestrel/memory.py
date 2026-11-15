@@ -46,7 +46,46 @@ class NeuralMemory(nn.Module):
         h = F.normalize(h, dim=-1).permute(0, 3, 1, 2, 4).contiguous()
         return h.view(bsz * self.heads, num_chunks, self.chunk_size, self.head_dim).float()
 
-    def forward(self, x):
+    def _gates(self, chunk_ctx):
+        """Per-head forget (alpha), momentum (eta) and inner-lr (theta) gates, shaped (B * H, n, 1, 1)."""
+        bsz, num_chunks, _ = chunk_ctx.shape
+        gates = self.gate_proj(chunk_ctx).view(bsz, num_chunks, self.heads, 3).permute(0, 2, 1, 3).contiguous()
+        gates = gates.view(bsz * self.heads, num_chunks, 3).float()
+        alpha = (self.min_forget + (1.0 - self.min_forget) * torch.sigmoid(gates[..., 0] + self.forget_bias))[..., None, None]
+        eta = torch.sigmoid(gates[..., 1])[..., None, None]
+        theta = 0.05 * torch.sigmoid(gates[..., 2])[..., None, None]
+        return alpha, eta, theta
+
+    def _initial_state(self, bsz):
+        w1_base = self.w1_init.unsqueeze(0) if self.heads == 1 else self.w1_init
+        w2_base = self.w2_init.unsqueeze(0) if self.heads == 1 else self.w2_init
+        w1 = w1_base.float().unsqueeze(0).expand(bsz, -1, -1, -1).reshape(bsz * self.heads, self.mem_head_dim, self.head_dim).clone()
+        w2 = w2_base.float().unsqueeze(0).expand(bsz, -1, -1, -1).reshape(bsz * self.heads, self.head_dim, self.mem_head_dim).clone()
+        return w1, w2, torch.zeros_like(w1), torch.zeros_like(w2)
+
+    @staticmethod
+    def _retrieve(qc, w1, w2):
+        return torch.bmm(F.silu(torch.bmm(qc, w1.transpose(1, 2))), w2.transpose(1, 2))
+
+    def _update(self, state, kc, vc, a_i, e_i, t_i):
+        """One momentum step on the closed-form gradient of 0.5 / C * ||M(kc) - vc||^2."""
+        w1, w2, s1, s2 = state
+        hk = torch.bmm(kc, w1.transpose(1, 2))  # (B * H, C, m_h)
+        ak, dsilu = _silu_and_grad(hk)
+        pred = torch.bmm(ak, w2.transpose(1, 2))
+        err = (pred - vc) * (1.0 / self.chunk_size)  # (B * H, C, d_h)
+
+        gw2 = torch.bmm(err.transpose(1, 2), ak)  # (B * H, d_h, m_h)
+        dak = torch.bmm(err, w2) * dsilu          # (B * H, C, m_h)
+        gw1 = torch.bmm(dak.transpose(1, 2), kc)  # (B * H, m_h, d_h)
+
+        s1 = e_i * s1 - t_i * gw1
+        s2 = e_i * s2 - t_i * gw2
+        return (1.0 - a_i) * w1 + s1, (1.0 - a_i) * w2 + s2, s1, s2
+
+    def forward(self, x, cache=None):
+        if cache is not None:
+            return self._forward_cached(x, cache)
         bsz, seq_len, dim = x.shape
         c = self.chunk_size
         pad = (c - seq_len % c) % c
@@ -59,51 +98,58 @@ class NeuralMemory(nn.Module):
         k = self._project_qkv(self.k_proj, x, bsz, num_chunks)
         v = self._project_qkv(self.v_proj, x, bsz, num_chunks)
         # Average chunk hidden state drives scalar forget/momentum/lr gates per head.
-        chunk_ctx = x.view(bsz, num_chunks, c, dim).mean(dim=2)
-        gates = self.gate_proj(chunk_ctx).view(bsz, num_chunks, self.heads, 3).permute(0, 2, 1, 3).contiguous()
-        gates = gates.view(bsz * self.heads, num_chunks, 3).float()
-        alpha = (self.min_forget + (1.0 - self.min_forget) * torch.sigmoid(gates[..., 0] + self.forget_bias))[..., None, None]
-        eta = torch.sigmoid(gates[..., 1])[..., None, None]
-        theta = 0.05 * torch.sigmoid(gates[..., 2])[..., None, None]
-
-        w1_base = self.w1_init.unsqueeze(0) if self.heads == 1 else self.w1_init
-        w2_base = self.w2_init.unsqueeze(0) if self.heads == 1 else self.w2_init
-        w1 = w1_base.float().unsqueeze(0).expand(bsz, -1, -1, -1).reshape(bsz * self.heads, self.mem_head_dim, self.head_dim).clone()
-        w2 = w2_base.float().unsqueeze(0).expand(bsz, -1, -1, -1).reshape(bsz * self.heads, self.head_dim, self.mem_head_dim).clone()
-        s1 = torch.zeros_like(w1)
-        s2 = torch.zeros_like(w2)
+        alpha, eta, theta = self._gates(x.view(bsz, num_chunks, c, dim).mean(dim=2))
+        state = self._initial_state(bsz)
 
         outputs = []
-        inv_c = 1.0 / c
         for idx in range(num_chunks):
-            qc = q[:, idx]  # (B * H, C, d_h)
-            kc = k[:, idx]
-            vc = v[:, idx]
-
             # Retrieve from current memory state (before updating on chunk idx -> causal).
-            hq = torch.bmm(qc, w1.transpose(1, 2))
-            outputs.append(torch.bmm(F.silu(hq), w2.transpose(1, 2)))
-
-            # Closed-form gradient of 0.5 / C * ||M(kc) - vc||^2 wrt w1, w2.
-            hk = torch.bmm(kc, w1.transpose(1, 2))  # (B * H, C, m_h)
-            ak, dsilu = _silu_and_grad(hk)
-            pred = torch.bmm(ak, w2.transpose(1, 2))
-            err = (pred - vc) * inv_c  # (B * H, C, d_h)
-
-            gw2 = torch.bmm(err.transpose(1, 2), ak)  # (B * H, d_h, m_h)
-            dak = torch.bmm(err, w2) * dsilu          # (B * H, C, m_h)
-            gw1 = torch.bmm(dak.transpose(1, 2), kc)  # (B * H, m_h, d_h)
-
-            a_i = alpha[:, idx]
-            e_i = eta[:, idx]
-            t_i = theta[:, idx]
-            s1 = e_i * s1 - t_i * gw1
-            s2 = e_i * s2 - t_i * gw2
-            w1 = (1.0 - a_i) * w1 + s1
-            w2 = (1.0 - a_i) * w2 + s2
+            outputs.append(self._retrieve(q[:, idx], state[0], state[1]))
+            if idx + 1 < num_chunks:
+                state = self._update(state, k[:, idx], v[:, idx], alpha[:, idx], eta[:, idx], theta[:, idx])
 
         out = torch.cat(outputs, dim=1).view(bsz, self.heads, padded_len, self.head_dim)
         out = out.permute(0, 2, 1, 3).contiguous().view(bsz, padded_len, dim)[:, :seq_len].to(x.dtype)
+        return self.out_proj(out)
+
+    def _forward_cached(self, x, cache):
+        """Streaming forward for decoding. Gives the same outputs as forward() on the whole sequence.
+
+        The cache holds the memory state after the last complete chunk, plus the
+        hidden states, keys and values of the current incomplete chunk. The memory
+        updates only when a chunk is complete, as in the parallel path.
+        """
+        bsz, seq_len, dim = x.shape
+        c = self.chunk_size
+        if "state" not in cache:
+            cache["state"] = self._initial_state(bsz)
+            cache["x"] = x.new_zeros(bsz, 0, dim)
+            cache["k"] = x.new_zeros(bsz * self.heads, 0, self.head_dim, dtype=torch.float32)
+            cache["v"] = x.new_zeros(bsz * self.heads, 0, self.head_dim, dtype=torch.float32)
+
+        def project(proj):
+            h = F.normalize(proj(x).view(bsz, seq_len, self.heads, self.head_dim), dim=-1)
+            return h.transpose(1, 2).reshape(bsz * self.heads, seq_len, self.head_dim).float()
+
+        q, k, v = project(self.q_proj), project(self.k_proj), project(self.v_proj)
+        outputs = []
+        start = 0
+        while start < seq_len:
+            n = min(c - cache["x"].shape[1], seq_len - start)
+            span = slice(start, start + n)
+            w1, w2 = cache["state"][:2]
+            outputs.append(self._retrieve(q[:, span], w1, w2))
+            cache["x"] = torch.cat([cache["x"], x[:, span]], dim=1)
+            cache["k"] = torch.cat([cache["k"], k[:, span]], dim=1)
+            cache["v"] = torch.cat([cache["v"], v[:, span]], dim=1)
+            if cache["x"].shape[1] == c:
+                alpha, eta, theta = self._gates(cache["x"].mean(dim=1, keepdim=True))
+                cache["state"] = self._update(cache["state"], cache["k"], cache["v"], alpha[:, 0], eta[:, 0], theta[:, 0])
+                cache["x"], cache["k"], cache["v"] = cache["x"][:, :0], cache["k"][:, :0], cache["v"][:, :0]
+            start += n
+
+        out = torch.cat(outputs, dim=1).view(bsz, self.heads, seq_len, self.head_dim)
+        out = out.transpose(1, 2).reshape(bsz, seq_len, dim).to(x.dtype)
         return self.out_proj(out)
 
 
@@ -125,21 +171,34 @@ class SlidingWindowAttention(nn.Module):
         self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, cos, sin, cache=None):
         bsz, seq_len, _ = x.shape
         q = self.q_norm(self.q_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim)).transpose(1, 2)
         k = self.k_norm(self.k_proj(x).view(bsz, seq_len, self.num_kv_heads, self.head_dim)).transpose(1, 2)
         v = self.v_proj(x).view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        if cache is not None:
+            # Keys and values are stored after QK-norm and RoPE. RoPE is relative,
+            # so the cache only needs the last window - 1 positions.
+            if "k" in cache:
+                k = torch.cat([cache["k"], k], dim=2)
+                v = torch.cat([cache["v"], v], dim=2)
+            keep = self.window - 1
+            cache["k"] = k[:, :, max(0, k.shape[2] - keep):]
+            cache["v"] = v[:, :, max(0, v.shape[2] - keep):]
+        key_len = k.shape[2]
+        past = key_len - seq_len
         if self.num_kv_groups > 1:
             k = k.repeat_interleave(self.num_kv_groups, dim=1)
             v = v.repeat_interleave(self.num_kv_groups, dim=1)
 
-        if self.window >= seq_len:
+        if past == 0 and self.window >= seq_len:
             attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        elif seq_len == 1 and key_len <= self.window:
+            attn = F.scaled_dot_product_attention(q, k, v)
         else:
-            pos = torch.arange(seq_len, device=x.device)
-            diff = pos[:, None] - pos[None, :]
+            pos = torch.arange(key_len, device=x.device)
+            diff = pos[past:, None] - pos[None, :]
             mask = (diff >= 0) & (diff < self.window)
             attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         return self.o_proj(attn.transpose(1, 2).contiguous().view(bsz, seq_len, -1))
@@ -164,10 +223,11 @@ class TitansMAGBlock(nn.Module):
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = Qwen3MLP(config)
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, cos, sin, cache=None):
         h = self.input_layernorm(x)
-        attn_out = self.attn_norm(self.self_attn(h, cos, sin))
-        mem_out = self.mem_norm(self.memory(h))
+        attn_cache, mem_cache = (None, None) if cache is None else (cache.setdefault("attn", {}), cache.setdefault("mem", {}))
+        attn_out = self.attn_norm(self.self_attn(h, cos, sin, attn_cache))
+        mem_out = self.mem_norm(self.memory(h, mem_cache))
         gate = torch.sigmoid(self.mag_gate(h))
         x = x + (1.0 - gate) * attn_out + gate * mem_out
         x = x + self.mlp(self.post_attention_layernorm(x))
@@ -214,37 +274,71 @@ class TitansMAGForCausalLM(nn.Module):
     def get_output_embeddings(self):
         return self.lm_head
 
-    def forward(self, input_ids, **kwargs):
+    def forward(self, input_ids, cache=None, logits_to_keep=0, **kwargs):
+        """Run the model. With a cache dict, continue from the tokens that it holds.
+
+        The cache is a plain dict that this method fills on the first call. Each
+        block call (prelude, every loop of the core, coda) gets its own entry.
+        """
         x = self.embed_tokens(input_ids)
-        pos_ids = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
+        offset = 0 if cache is None else cache.get("pos", 0)
+        pos_ids = torch.arange(offset, offset + input_ids.shape[1], device=input_ids.device).unsqueeze(0)
         cos, sin = self.rotary_emb(x, pos_ids)
+        layer_caches = None if cache is None else iter(cache.setdefault("layers", [{} for _ in range(self._block_calls())]))
+
+        def run(layer, x):
+            return layer(x, cos, sin, None if layer_caches is None else next(layer_caches))
+
         if hasattr(self, "prelude"):
             for layer in self.prelude:
-                x = layer(x, cos, sin)
+                x = run(layer, x)
         if self.num_loops > 1:
             x0_normed = self.loop_x0_norm(x)
             for loop_idx in range(self.num_loops):
                 x = x + self.loop_inject(x0_normed) + self.loop_embed[loop_idx]
                 for layer in self.layers:
-                    x = layer(x, cos, sin)
+                    x = run(layer, x)
         else:
             for layer in self.layers:
-                x = layer(x, cos, sin)
+                x = run(layer, x)
         if hasattr(self, "coda"):
             for layer in self.coda:
-                x = layer(x, cos, sin)
+                x = run(layer, x)
+        if cache is not None:
+            cache["pos"] = offset + input_ids.shape[1]
+        if logits_to_keep:
+            x = x[:, -logits_to_keep:]
         logits = self.lm_head(self.norm(x))
         return SimpleNamespace(logits=logits)
 
+    def _block_calls(self):
+        prelude = len(self.prelude) if hasattr(self, "prelude") else 0
+        coda = len(self.coda) if hasattr(self, "coda") else 0
+        return prelude + self.num_loops * len(self.layers) + coda
+
     @torch.no_grad()
     def generate(self, input_ids, max_new_tokens=64, do_sample=True, temperature=1.0,
-                 top_k=0, top_p=1.0, repetition_penalty=1.0, eos_token_id=None, bad_words_ids=None, **kwargs):
+                 top_k=0, top_p=1.0, repetition_penalty=1.0, eos_token_id=None, bad_words_ids=None,
+                 use_cache=True, **kwargs):
+        """Sample new tokens.
+
+        With use_cache, the prompt runs once and each step then feeds only the
+        newest token. This gives the same logits as the uncached path while the
+        sequence fits in max_position_embeddings. After that, the cached path
+        keeps streaming (attention is local and RoPE is relative), but the
+        uncached path drops the oldest tokens and recomputes the memory.
+        """
         stop_ids = set(eos_token_id) if isinstance(eos_token_id, (list, tuple, set)) else ({eos_token_id} if eos_token_id is not None else set())
         bad_ids = [item[0] for item in bad_words_ids] if bad_words_ids else []
         tokens = input_ids
-        for _ in range(max_new_tokens):
-            ctx = tokens[:, -self.config.max_position_embeddings:]
-            logits = self(ctx).logits[:, -1, :]
+        max_ctx = self.config.max_position_embeddings
+        cache = {} if use_cache else None
+        for step in range(max_new_tokens):
+            if cache is None:
+                logits = self(tokens[:, -max_ctx:]).logits[:, -1, :]
+            else:
+                ctx = tokens[:, -max_ctx:] if step == 0 else tokens[:, -1:]
+                logits = self(ctx, cache=cache, logits_to_keep=1).logits[:, -1, :]
             if repetition_penalty != 1.0:
                 score = torch.gather(logits, 1, tokens)
                 score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
