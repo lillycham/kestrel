@@ -247,7 +247,7 @@ def test_titans_repetition_penalty(monkeypatch):
     base_logits[0, 0, 1] = 5.0
     base_logits[0, 0, 2] = 2.0
     base_logits[0, 0, 3] = -0.5
-    monkeypatch.setattr(model, "forward", lambda idx: SimpleNamespace(logits=base_logits))
+    monkeypatch.setattr(model, "forward", lambda idx, **kw: SimpleNamespace(logits=base_logits))
 
     # Seen positive logit (5.0 on token 1) beats 2.0 without penalty, but 5.0 / 4.0 = 1.25 < 2.0 with penalty=4.0.
     prompt = torch.tensor([[1, 3]])
@@ -258,7 +258,7 @@ def test_titans_repetition_penalty(monkeypatch):
     neg_logits = torch.full((1, 1, cfg["vocab_size"]), -10.0)
     neg_logits[0, 0, 3] = -0.5
     neg_logits[0, 0, 4] = -1.0
-    monkeypatch.setattr(model, "forward", lambda idx: SimpleNamespace(logits=neg_logits))
+    monkeypatch.setattr(model, "forward", lambda idx, **kw: SimpleNamespace(logits=neg_logits))
     assert model.generate(prompt, max_new_tokens=1, do_sample=False, repetition_penalty=4.0)[0, -1].item() == 4
 
 
@@ -307,3 +307,30 @@ def test_looped_titans_mag_and_checkpoint_archive(tmp_path):
     bad_cfg["model"]["num_loops"] = 2
     with pytest.raises(ValueError, match="require memory_chunk_size"):
         make_model(bad_cfg["model"])
+
+
+@pytest.mark.parametrize("looped", [False, True])
+def test_titans_cached_decode_matches_full_forward(looped):
+    # The prompt and each step cross memory-chunk (4) and attention-window (8) boundaries.
+    cfg = dict(read_config(ROOT / "configs/titans_smoke.toml")["model"])
+    if looped:
+        cfg.update(memory_hidden_size=32, memory_heads=4, memory_min_forget=0.05, norm_attn_branch=True,
+                   num_hidden_layers=1, prelude_layers=1, num_loops=3, coda_layers=1)
+    torch.manual_seed(0)
+    model = make_model(cfg).eval()
+    for module in model.modules():
+        if hasattr(module, "w1_init"):
+            module.gate_proj.weight.data.normal_(0.0, 1.0)  # Make the memory updates matter.
+    ids = torch.randint(10, 500, (1, cfg["max_position_embeddings"]))
+    with torch.no_grad():
+        full = model(ids).logits
+        for prompt_len in (1, 3, 4, 13):
+            cache = {}
+            pieces = [model(ids[:, :prompt_len], cache=cache).logits]
+            pieces += [model(ids[:, t:t + 1], cache=cache).logits for t in range(prompt_len, ids.shape[1])]
+            torch.testing.assert_close(torch.cat(pieces, dim=1), full, rtol=1e-4, atol=1e-4)
+        prompt = ids[:, :5]
+        torch.testing.assert_close(
+            model.generate(prompt, max_new_tokens=20, do_sample=False, use_cache=True),
+            model.generate(prompt, max_new_tokens=20, do_sample=False, use_cache=False),
+        )
