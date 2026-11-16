@@ -450,3 +450,42 @@ def test_grpo_run_and_resume(tmp_path):
     records = [json.loads(line) for line in (tmp_path / "rl/metrics.jsonl").read_text().splitlines()]
     assert [r["step"] for r in records] == [0, 1, 2, 3]
     sample(tmp_path / "rl", "Compute 1 + 2 step by step.", "cpu", max_new_tokens=4, raw=True)
+
+
+
+@pytest.mark.parametrize("config", ["smoke", "titans_smoke", "looped"])
+@pytest.mark.parametrize("ablate", [(), ((0, 1), (1, 2))])
+def test_playground_cached_sample_is_the_uncached_sample(tmp_path, config, ablate):
+    pytest.importorskip("suzunaan")
+    from suzunaan import Prompt
+    from suzunaan.sample import sample as playground_sample
+    from kestrel.playground import KestrelBackend
+
+    training = tmp_path / "train.jsonl"
+    training.write_text("\n".join(json.dumps({"text": f"playground document {i} " * 8}) for i in range(12)))
+    train_tokenizer(training, tmp_path / "tokenizer", 300)  # Fewer than vocab_size: unused rows.
+    tok = load_tokenizer(tmp_path / "tokenizer")
+    cfg = dict(read_config(ROOT / f"configs/{'titans_smoke' if config == 'looped' else config}.toml")["model"])
+    if config == "looped":
+        cfg.update(memory_hidden_size=32, memory_heads=4, num_hidden_layers=1, prelude_layers=1, num_loops=3, coda_layers=1)
+    torch.manual_seed(0)
+    model = make_model(cfg, {"bos_token_id": tok.bos_token_id, "eos_token_id": tok.eos_token_id,
+                             "pad_token_id": tok.pad_token_id})
+    for module in model.modules():
+        if hasattr(module, "w1_init"):
+            module.gate_proj.weight.data.normal_(0.0, 1.0)  # Make the memory updates matter.
+    torch.save({"config": {"model": cfg}, "model": model.state_dict()}, tmp_path / "latest.pt")
+
+    backend = KestrelBackend(tmp_path / "latest.pt", tmp_path / "tokenizer", torch.device("cpu"))
+    calls = []
+    uncached_logits = backend.logits
+    backend.logits = lambda ids: calls.append(len(ids)) or uncached_logits(ids)
+    # No stop token, and past the context, where the window recomputes from scratch.
+    prompt = Prompt(list(range(20, 25)))
+    n = backend.context + 6
+    run = lambda: [t["id"] for t in playground_sample(backend, prompt, n, seed=3, top_k=20, ablate=ablate)]
+    cached = run()
+    assert len(calls) == n - (backend.context - 5 + 1)    # uncached only past the context
+    backend.decoder = None
+    assert run() == cached
+    assert all(i < len(tok) for i in cached)              # the unused rows stay masked

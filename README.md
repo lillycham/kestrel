@@ -98,6 +98,18 @@ The command formats one user turn and generates one assistant reply.
 The initial version has no interactive chat loop.
 A functional smoke test does not establish conversational ability.
 
+## Playground
+
+```sh
+python -m kestrel playground --device cpu   # then open http://localhost:8000
+```
+
+The playground uses suzunaan, a separate flake input.
+It lists every run in `runs/` and the `step_*.pt` snapshots of each run.
+It can write text, chat, compare two models with one seed, and show token probabilities.
+It also shows attention, the logit lens, a head map and neuron activations, and it can switch off heads.
+A looped Titans model counts each run of a block as a separate layer.
+
 ## Initial checks
 
 The tests cover causal attention, tied parameters, optimizer groups and WSD boundaries.

@@ -18,7 +18,25 @@
     },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "suzunaan": "suzunaan"
+      }
+    },
+    "suzunaan": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1794758435,
+        "narHash": "sha256-Axwk3S0icPtJtBDsRwNdZ1RodjlUHYdOGL7ureWj2zo=",
+        "path": "/Users/lcham/devel/suzunaan",
+        "type": "path"
+      },
+      "original": {
+        "path": "/Users/lcham/devel/suzunaan",
+        "type": "path"
       }
     }
   },
