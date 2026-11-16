@@ -126,6 +126,9 @@ class KestrelBackend:
         x = torch.tensor([ids], device=self.device)
         return self.masked(self.model(x, use_cache=False).logits[0, -1].float())
 
+    def decoder(self):
+        return KestrelDecoder(self)
+
     def unembed(self, h):
         return self.masked(self.head(self.norm(h)).float())
 
@@ -167,6 +170,28 @@ class KestrelBackend:
             add(self.model.register_forward_pre_hook(reset, with_kwargs=True))
             with zero_heads([b.self_attn.o_proj for b in self.blocks], heads, self.head_dim, counter):
                 yield
+
+
+class KestrelDecoder:
+    """Cached generation for one sample: each call runs only the ids that the cache has
+    not seen. Titans-MAG keeps its own cache dict (the sliding-window keys and values
+    and the memory state of each block run); Qwen3 keeps HF past_key_values. Within the
+    context both give the logits of KestrelBackend.logits."""
+
+    def __init__(self, backend):
+        self.b, self.fed = backend, 0
+        self.cache = {} if backend.titans else None
+
+    def logits(self, ids):
+        b = self.b
+        x = torch.tensor([ids[self.fed:]], device=b.device)
+        if b.titans:
+            out = b.model(x, cache=self.cache, logits_to_keep=1)
+        else:
+            out = b.model(x, past_key_values=self.cache, use_cache=True, logits_to_keep=1)
+            self.cache = out.past_key_values
+        self.fed = len(ids)
+        return b.masked(out.logits[0, -1].float())
 
 
 def catalog(root="runs"):
