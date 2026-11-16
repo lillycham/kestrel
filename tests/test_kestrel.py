@@ -604,3 +604,42 @@ def test_hnet_stage_learning_rates(tmp_path):
     assert len(groups) == 3
     with pytest.raises(ValueError):
         make_model(dict(read_config(ROOT / "configs/smoke.toml")["model"], lr_multiplier=2.0))
+
+
+@pytest.mark.parametrize("kind", ["decoder", "titans", "hnet-transformer", "hnet-titans"])
+def test_gradient_checkpointing_keeps_gradients(tmp_path, kind):
+    path = {"decoder": ROOT / "configs/smoke.toml", "titans": ROOT / "configs/titans_smoke.toml"}.get(kind)
+    if path is None:
+        path = hnet_config(tmp_path, kind.split("-")[1])
+    cfg = read_config(path)
+    torch.manual_seed(3)
+    model = make_model(cfg["model"]).train()
+    x = torch.randint(7, 200, (2, 24))
+
+    def grads():
+        model.zero_grad(set_to_none=True)
+        output = model(input_ids=x, use_cache=False)
+        loss = output.logits.float().logsumexp(-1).mean() + getattr(output, "aux_loss", 0.0)
+        loss.backward()
+        return {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
+
+    plain = grads()
+    if hasattr(model, "set_gradient_checkpointing"):
+        model.set_gradient_checkpointing(True)
+    else:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    checkpointed = grads()
+    assert plain.keys() == checkpointed.keys()
+    for name in plain:
+        torch.testing.assert_close(checkpointed[name], plain[name], msg=name)
+
+    if kind == "hnet-titans":
+        text = path.read_text().replace("seed = 7", "seed = 7\ngradient_checkpointing = true")
+        path.write_text(text)
+        training = tmp_path / "train.jsonl"
+        validation = tmp_path / "validation.jsonl"
+        training.write_text("\n".join(json.dumps({"text": f"long document {i} " * 8}) for i in range(12)))
+        validation.write_text("\n".join(json.dumps({"text": f"val document {i} " * 8}) for i in range(4)))
+        train_tokenizer(training, tmp_path / "tokenizer", 263)
+        prepare(training, validation, tmp_path / "tokenizer", tmp_path / "encoded")
+        assert train(path, tmp_path / "encoded", tmp_path / "run", "cpu").main.model.gradient_checkpointing

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP, Qwen3RMSNorm, Qwen3RotaryEmbedding, apply_rotary_pos_emb
 
 
@@ -280,6 +281,7 @@ class TitansMAGForCausalLM(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.gradient_checkpointing = False
         self.num_loops = getattr(config, "num_loops", 1)
         prelude_layers = getattr(config, "prelude_layers", 0)
         coda_layers = getattr(config, "coda_layers", 0)
@@ -330,6 +332,8 @@ class TitansMAGForCausalLM(nn.Module):
         layer_caches = None if cache is None else iter(cache.setdefault("layers", [{} for _ in range(self._block_calls())]))
 
         def run(layer, x):
+            if layer_caches is None and self.gradient_checkpointing and torch.is_grad_enabled():
+                return checkpoint(layer, x, cos, sin, use_reentrant=False)
             return layer(x, cos, sin, None if layer_caches is None else next(layer_caches))
 
         if hasattr(self, "prelude"):
@@ -355,6 +359,10 @@ class TitansMAGForCausalLM(nn.Module):
             x = x[:, -logits_to_keep:]
         logits = self.lm_head(self.norm(x))
         return SimpleNamespace(logits=logits)
+
+    def set_gradient_checkpointing(self, enabled):
+        """Recompute each block in the backward pass instead of storing its activations."""
+        self.gradient_checkpointing = enabled
 
     def _block_calls(self):
         prelude = len(self.prelude) if hasattr(self, "prelude") else 0

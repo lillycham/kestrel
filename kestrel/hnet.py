@@ -16,6 +16,8 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+from transformers.utils import logging as hf_logging
 from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP, Qwen3RMSNorm, Qwen3RotaryEmbedding
 
 from .memory import SlidingWindowAttention, TitansMAGForCausalLM
@@ -107,6 +109,20 @@ class QwenMain(nn.Module):
     def forward(self, x):
         return self.model(inputs_embeds=x, use_cache=False).last_hidden_state
 
+    def set_gradient_checkpointing(self, enabled):
+        if enabled:
+            # Transformers warns that gradients cannot reach the (removed) token
+            # embeddings. That only concerns reentrant checkpointing; this body gets
+            # its inputs from up_proj, and gradients reach it (see the tests).
+            verbosity = hf_logging.get_verbosity()
+            hf_logging.set_verbosity_error()
+            try:
+                self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            finally:
+                hf_logging.set_verbosity(verbosity)
+        else:
+            self.model.gradient_checkpointing_disable()
+
 
 class TitansMain(nn.Module):
     """A Looped Titans-MAG body (no embedding or head) for the chunk sequence."""
@@ -118,6 +134,9 @@ class TitansMain(nn.Module):
 
     def forward(self, x):
         return self.model(inputs_embeds=x, hidden_only=True)
+
+    def set_gradient_checkpointing(self, enabled):
+        self.model.set_gradient_checkpointing(enabled)
 
 
 class HNetForCausalLM(nn.Module):
@@ -153,6 +172,17 @@ class HNetForCausalLM(nn.Module):
             self.lm_head.weight = self.embed_tokens.weight
         self.main = main
         self.last_stats = {}
+        self.gradient_checkpointing = False
+
+    def set_gradient_checkpointing(self, enabled):
+        """Recompute each byte layer and main-network layer in the backward pass."""
+        self.gradient_checkpointing = enabled
+        self.main.set_gradient_checkpointing(enabled)
+
+    def _layer(self, layer, x, cos, sin):
+        if self.gradient_checkpointing and torch.is_grad_enabled():
+            return checkpoint(layer, x, cos, sin, use_reentrant=False)
+        return layer(x, cos, sin)
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -165,7 +195,7 @@ class HNetForCausalLM(nn.Module):
         pos = torch.arange(input_ids.shape[1], device=input_ids.device)[None, :]
         cos, sin = self.rotary_emb(x, pos)
         for layer in self.encoder:
-            x = layer(x, cos, sin)
+            x = self._layer(layer, x, cos, sin)
         h = self.encoder_norm(x)
 
         p = boundary_probs(self.router_q(h), self.router_k(h))
@@ -176,7 +206,7 @@ class HNetForCausalLM(nn.Module):
         x = upsample(zbar, b, p) + self.residual_proj(h)
 
         for layer in self.decoder:
-            x = layer(x, cos, sin)
+            x = self._layer(layer, x, cos, sin)
         if logits_to_keep:
             x = x[:, -logits_to_keep:]
         logits = self.lm_head(self.norm(x))

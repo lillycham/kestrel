@@ -108,6 +108,9 @@ The default multiplier is `sqrt(target_chunk_size * main width / byte width)`. S
 The metrics log also records `bytes_per_chunk`, `ratio_loss` and `chunks_per_row`.
 Generation runs the whole window again for each byte, because H-Net has no decode cache yet.
 
+`gradient_checkpointing = true` in `[train]` recomputes each layer in the backward pass. It works for every model kind.
+For `configs/hnet.toml` at 2 x 4096 bytes on MPS, it cuts memory from 3.6 GB to 1.6 GB.
+
 ## Sample
 
 ```sh

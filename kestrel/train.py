@@ -125,6 +125,11 @@ def train(config_path, data_path, output, requested_device="auto", resume=False,
         "bos_token_id": tokenizer.bos_token_id, "eos_token_id": tokenizer.eos_token_id,
         "pad_token_id": tokenizer.pad_token_id,
     }).to(device)
+    if settings.get("gradient_checkpointing", False):
+        if hasattr(raw_model, "set_gradient_checkpointing"):
+            raw_model.set_gradient_checkpointing(True)
+        else:
+            raw_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     optimizers = make_optimizers(raw_model, settings)
     output = Path(output)
     start = 0
