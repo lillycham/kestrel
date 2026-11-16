@@ -573,3 +573,34 @@ def test_hnet_causality_and_train(tmp_path, main):
     assert all(r["bytes_per_chunk"] >= 1 and "ratio_loss" in r for r in records)
     assert any("validation_loss" in r for r in records)
     sample(tmp_path / "run", "long", max_new_tokens=4, temperature=0, raw=True)
+
+
+@pytest.mark.parametrize("length,window", [(5, 8), (8, 8), (10, 4), (37, 8), (300, 64)])
+def test_local_window_attention_matches_dense(length, window):
+    from kestrel.memory import dense_window_attention, local_window_attention
+
+    torch.manual_seed(length)
+    q, k, v = (torch.randn(2, 3, length, 8) for _ in range(3))
+    torch.testing.assert_close(local_window_attention(q, k, v, window), dense_window_attention(q, k, v, window))
+
+
+def test_hnet_stage_learning_rates(tmp_path):
+    cfg = read_config(hnet_config(tmp_path, "transformer"))
+    model = make_model(cfg["model"])
+    multiplier = model.config.lr_multiplier
+    assert multiplier == pytest.approx((4.0 * 48 / 32) ** 0.5)
+    inner = {id(p) for p in model.main.parameters()}
+    seen = []
+    for optimizer, base in zip(make_optimizers(model, cfg["train"]), (cfg["train"]["muon_lr"], cfg["train"]["adamw_lr"])):
+        for group in optimizer.param_groups:
+            in_main = {id(p) in inner for p in group["params"]}
+            assert len(in_main) == 1
+            assert group["base_lr"] == pytest.approx(base if in_main.pop() else base * multiplier)
+            seen += [id(p) for p in group["params"]]
+    assert len(seen) == len(set(seen)) == len(list(model.parameters()))
+
+    fixed = dict(cfg["model"], lr_multiplier=1.0)
+    groups = [g for o in make_optimizers(make_model(fixed), cfg["train"]) for g in o.param_groups]
+    assert len(groups) == 3
+    with pytest.raises(ValueError):
+        make_model(dict(read_config(ROOT / "configs/smoke.toml")["model"], lr_multiplier=2.0))

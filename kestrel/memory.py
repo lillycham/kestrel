@@ -196,12 +196,52 @@ class SlidingWindowAttention(nn.Module):
             attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         elif seq_len == 1 and key_len <= self.window:
             attn = F.scaled_dot_product_attention(q, k, v)
+        elif past == 0:
+            attn = local_window_attention(q, k, v, self.window)
         else:
-            pos = torch.arange(key_len, device=x.device)
-            diff = pos[past:, None] - pos[None, :]
-            mask = (diff >= 0) & (diff < self.window)
-            attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            attn = dense_window_attention(q, k, v, self.window, past)
         return self.o_proj(attn.transpose(1, 2).contiguous().view(bsz, seq_len, -1))
+
+
+def dense_window_attention(q, k, v, window, past=0):
+    """Sliding-window causal attention with a full (queries, keys) mask. q is (B, H, L, D); k and v hold past + L keys."""
+    pos = torch.arange(k.shape[2], device=q.device)
+    diff = pos[past:, None] - pos[None, :]
+    mask = (diff >= 0) & (diff < window)
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+
+
+def local_window_attention(q, k, v, window):
+    """Sliding-window causal attention in blocks of `window` queries. Same result as dense_window_attention.
+
+    Query t sees keys t - window + 1 .. t, which all lie in its own block or the
+    block before. So each block attends to 2 * window keys, and the cost is
+    O(L * window) rather than O(L^2). Inputs are (B, H, L, D) with no past keys.
+    """
+    bsz, heads, seq_len, dim = q.shape
+    blocks = -(-seq_len // window)
+    pad = blocks * window - seq_len
+    if pad:
+        q, k, v = (F.pad(t, (0, 0, 0, pad)) for t in (q, k, v))
+
+    def split(t):
+        return t.reshape(bsz, heads, blocks, window, dim)
+
+    def with_previous(t):
+        t = split(t)
+        return torch.cat([F.pad(t, (0, 0, 0, 0, 1, 0))[:, :, :-1], t], dim=3)  # (B, H, n, 2W, D)
+
+    qb, kb, vb = split(q), with_previous(k), with_previous(v)
+    # Query a of a block against key c of [previous block, this block]: distance a + W - c.
+    a = torch.arange(window, device=q.device)[:, None]
+    c = torch.arange(2 * window, device=q.device)[None, :]
+    diff = a + window - c
+    band = (diff >= 0) & (diff < window)
+    mask = band.expand(blocks, window, 2 * window).clone()
+    mask[0, :, :window] = False  # The first block has no previous block.
+    flat = lambda t: t.reshape(bsz, heads * blocks, *t.shape[3:])
+    attn = F.scaled_dot_product_attention(flat(qb), flat(kb), flat(vb), attn_mask=mask.repeat(heads, 1, 1))
+    return attn.reshape(bsz, heads, blocks * window, dim)[:, :, :seq_len]
 
 
 class TitansMAGBlock(nn.Module):

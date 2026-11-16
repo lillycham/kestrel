@@ -102,6 +102,8 @@ python -m kestrel prepare --train data/train.jsonl --validation data/validation.
 ```
 
 `target_chunk_size` is the target number of bytes per chunk, and `ratio_loss_weight` scales the ratio loss.
+The byte stage trains at a higher learning rate than the main network, as in the H-Net paper.
+The default multiplier is `sqrt(target_chunk_size * main width / byte width)`. Set `lr_multiplier` in `[model]` to change it.
 `train_loss` includes the ratio loss. `validation_loss` is cross-entropy per byte only.
 The metrics log also records `bytes_per_chunk`, `ratio_loss` and `chunks_per_row`.
 Generation runs the whole window again for each byte, because H-Net has no decode cache yet.

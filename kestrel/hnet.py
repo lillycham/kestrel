@@ -141,9 +141,10 @@ class HNetForCausalLM(nn.Module):
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
         self.lm_head = nn.Linear(d, config.vocab_size, bias=False)
         self.apply(TitansMAGForCausalLM._init_weights)
-        # The paper starts the router at identity, so p first measures how much
-        # consecutive encoder states differ, and the residual at zero, so the
-        # decoder must first learn to use the main network.
+        # Start the router at identity, so p first measures how much consecutive
+        # encoder states differ (our choice; the paper does not give this init).
+        # Start the residual at zero, as the paper does, so the decoder must
+        # first learn to use the main network.
         with torch.no_grad():
             self.router_q.weight.copy_(torch.eye(d))
             self.router_k.weight.copy_(torch.eye(d))

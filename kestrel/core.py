@@ -25,7 +25,7 @@ def read_config(path):
         "memory_heads", "memory_forget_bias", "memory_min_forget", "norm_attn_branch",
         "num_loops", "prelude_layers", "coda_layers",
         "architecture", "encoder_layers", "decoder_layers", "target_chunk_size",
-        "ratio_loss_weight", "main",
+        "ratio_loss_weight", "main", "lr_multiplier",
     }
     if set(model) - allowed_model:
         raise ValueError(f"Unknown model options: {set(model) - allowed_model}")
@@ -67,8 +67,8 @@ def make_model(settings, special_ids=None):
         return make_hnet(settings, special_ids)
     if architecture != "decoder":
         raise ValueError("architecture must be 'decoder' or 'hnet'")
-    if HNET_KEYS & set(settings):
-        raise ValueError(f"H-Net options need architecture = 'hnet': {HNET_KEYS & set(settings)}")
+    if (HNET_KEYS | {"lr_multiplier"}) & set(settings):
+        raise ValueError(f"H-Net options need architecture = 'hnet': {(HNET_KEYS | {'lr_multiplier'}) & set(settings)}")
     theta = settings.pop("rope_theta", 10000.0)
     memory_chunk = settings.pop("memory_chunk_size", None)
     memory_hidden = settings.pop("memory_hidden_size", None)
@@ -138,6 +138,9 @@ def make_hnet(settings, special_ids=None):
     if TITANS_KEYS & set(settings) or "num_hidden_layers" in settings:
         raise ValueError("Put main-network layers and memory options under [model.main]")
     main = dict(settings.pop("main"))
+    # Byte-stage LR relative to the main network (H-Net paper, Appendix C, one stage):
+    # sqrt(bytes per chunk * main width / byte width). The paper calls it a heuristic.
+    multiplier = settings.pop("lr_multiplier", None)
     network = main.pop("network", "transformer")
     hnet = {key: settings.pop(key) for key in sorted(HNET_KEYS - {"main"})}
     for key in ("encoder_layers", "decoder_layers"):
@@ -180,6 +183,11 @@ def make_hnet(settings, special_ids=None):
     config.attention_window = window
     config.main_network = network
     config.main_hidden_size = main["hidden_size"]
+    if multiplier is None:
+        multiplier = math.sqrt(hnet["target_chunk_size"] * main["hidden_size"] / settings["hidden_size"])
+    if not math.isfinite(multiplier) or multiplier <= 0:
+        raise ValueError("lr_multiplier must be finite and positive")
+    config.lr_multiplier = float(multiplier)
     for key, value in hnet.items():
         setattr(config, key, value)
     return HNetForCausalLM(config, body)
@@ -198,13 +206,22 @@ def make_optimizers(model, train):
             matrices.append(p)
         else:
             no_decay.append(p)
+    # An H-Net trains its byte stage (everything outside model.main) at a higher LR.
+    multiplier = getattr(model.config, "lr_multiplier", 1.0) if hasattr(model, "main") else 1.0
+    inner = {id(p) for p in model.main.parameters()} if multiplier != 1.0 else set()
+
+    def groups(params, lr, **extra):
+        outer = [p for p in params if multiplier != 1.0 and id(p) not in inner]
+        rest = [p for p in params if multiplier == 1.0 or id(p) in inner]
+        return [{"params": ps, "lr": lr * m, **extra} for ps, m in ((rest, 1.0), (outer, multiplier)) if ps]
+
     muon = torch.optim.Muon(
-        matrices, lr=train["muon_lr"], weight_decay=train["weight_decay"],
+        groups(matrices, train["muon_lr"]), lr=train["muon_lr"], weight_decay=train["weight_decay"],
         adjust_lr_fn="original",
     )
     adam = torch.optim.AdamW(
-        [{"params": decay, "weight_decay": train["weight_decay"]},
-         {"params": no_decay, "weight_decay": 0.0}],
+        groups(decay, train["adamw_lr"], weight_decay=train["weight_decay"])
+        + groups(no_decay, train["adamw_lr"], weight_decay=0.0),
         lr=train["adamw_lr"], betas=(0.9, 0.95),
     )
     for optimizer in (muon, adam):
