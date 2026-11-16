@@ -53,16 +53,18 @@ def ratio_loss(p, b, target):
     return target / (target - 1) * ((target - 1) * f * g + (1 - f) * (1 - g))
 
 
-def downsample(h, b):
+def downsample(h, b, bucket=0):
     """Gather the boundary positions of each row to the front, in order.
 
     Returns chunks (B, M, d), the positions (B, M) and a validity mask (B, M),
-    where M is the most chunks in any row. Rows with fewer chunks are padded at
-    the end with non-boundary positions; causal attention keeps the padding from
-    reaching the real chunks.
+    where M is the most chunks in any row (optionally rounded up to `bucket`).
+    Rows with fewer chunks are padded at the end with non-boundary positions;
+    causal attention keeps the padding from reaching the real chunks.
     """
     counts = b.sum(dim=1)
     most = int(counts.max())
+    if bucket > 0:
+        most = min(b.shape[1], ((most + bucket - 1) // bucket) * bucket)
     order = torch.argsort((~b).to(torch.int8), dim=1, stable=True)[:, :most]
     valid = torch.arange(most, device=b.device)[None, :] < counts[:, None]
     chunks = torch.gather(h, 1, order[..., None].expand(-1, -1, h.shape[-1]))
@@ -173,6 +175,17 @@ class HNetForCausalLM(nn.Module):
         self.main = main
         self.last_stats = {}
         self.gradient_checkpointing = False
+        self.chunk_bucket = 0
+
+    def compile_submodules(self):
+        """Compile static byte blocks and bucketed main network without altering state_dict keys."""
+        self.chunk_bucket = 256
+        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 32)
+        for layer in self.encoder:
+            layer.compile()
+        self.main.compile()
+        for layer in self.decoder:
+            layer.compile()
 
     def set_gradient_checkpointing(self, enabled):
         """Recompute each byte layer and main-network layer in the backward pass."""
@@ -200,7 +213,7 @@ class HNetForCausalLM(nn.Module):
 
         p = boundary_probs(self.router_q(h), self.router_k(h))
         b = p >= 0.5
-        chunks, positions, valid = downsample(h, b)
+        chunks, positions, valid = downsample(h, b, bucket=self.chunk_bucket)
         z = self.down_proj(self.main(self.up_proj(chunks)))
         zbar = smooth(z, torch.gather(p, 1, positions))
         x = upsample(zbar, b, p) + self.residual_proj(h)

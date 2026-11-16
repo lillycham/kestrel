@@ -42,9 +42,9 @@ coda_layers = 1
 
 [train]
 steps = 25000
-batch_size = 4
+batch_size = 8
 sequence_length = 4096
-gradient_accumulation = 8
+gradient_accumulation = 4
 warmup_steps = 500
 decay_steps = 5000
 muon_lr = 0.02
@@ -57,5 +57,5 @@ save_every = 1000
 keep_checkpoints = true
 seed = 42
 precision = "auto"
-# The chunk count varies per batch, so torch.compile would recompile often.
-compile = false
+# Buckets chunk length to multiples of 256 and compiles byte blocks + main network.
+compile = true

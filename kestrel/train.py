@@ -171,7 +171,11 @@ def train(config_path, data_path, output, requested_device="auto", resume=False,
     if end <= start:
         raise ValueError("No steps remain before stop-after/total steps")
     # Compile after loading/init so checkpoints always store clean unprefixed keys.
-    model = torch.compile(raw_model) if use_compile else raw_model
+    if use_compile and hasattr(raw_model, "compile_submodules"):
+        raw_model.compile_submodules()
+        model = raw_model
+    else:
+        model = torch.compile(raw_model) if use_compile else raw_model
     print(json.dumps({"device": str(device), "precision": precision, "compile": use_compile,
                       "parameters": sum(p.numel() for p in raw_model.parameters()),
                       "start_step": start, "end_step": end}), flush=True)
