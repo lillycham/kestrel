@@ -208,6 +208,10 @@ def train(config_path, data_path, output, requested_device="auto", resume=False,
             optimizer.step()
         done = step + 1
         record = {"step": done, "train_loss": total_loss, "lr_scale": scale}
+        if use_compile:
+            # Total graphs compiled so far. It should stop rising after a few
+            # hundred steps; a steady rise means recompilation on most steps.
+            record["compiled_graphs"] = torch._dynamo.utils.counters["stats"]["unique_graphs"]
         # H-Net chunk statistics from the last micro-batch (train_loss includes the ratio loss).
         stats = getattr(raw_model, "last_stats", {})
         if stats:

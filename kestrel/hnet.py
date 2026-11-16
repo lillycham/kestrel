@@ -237,6 +237,12 @@ class HNetForCausalLM(nn.Module):
         chunk recurrence in Python: a new chunk count must not compile an
         unrolled copy of the entire recurrence.
         """
+        # Each compiled main region keeps one graph per padding case and size
+        # range, in training and in evaluation. An 8 x 4 L4 benchmark from 512
+        # to 2048 chunks made 4 per region in training alone, so the default
+        # limit of 8 leaves no room for evaluation. Dynamo runs a region eager
+        # after the limit. The trainer logs compiled_graphs to show any storm.
+        torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 16)
         self._compiled_encode = torch.compile(self._encode_and_route, **compile_options)
         self._compiled_decode = torch.compile(self._decode, **compile_options)
         self.main.compile_layers(**compile_options)
