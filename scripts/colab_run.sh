@@ -18,6 +18,9 @@ if [ -z "${DATA_DIR:-}" ]; then
   fi
 fi
 
+# Raw JSONL can be shared between tokenizers (for example BPE and bytes).
+RAW_DIR="${RAW_DIR:-$DATA_DIR/raw}"
+
 if [ -z "${RUN_DIR:-}" ]; then
   if [ -d /content/drive/MyDrive ]; then
     RUN_DIR="/content/drive/MyDrive/kestrel/medium-1"
@@ -32,17 +35,17 @@ python -m pip install -q --no-deps -e .
 python -c "import datasets" 2>/dev/null || python -m pip install -q datasets
 
 if [ ! -f "$DATA_DIR/encoded/manifest.json" ]; then
-  if [ ! -f "$DATA_DIR/raw/train.jsonl" ] || [ ! -f "$DATA_DIR/raw/validation.jsonl" ]; then
+  if [ ! -f "$RAW_DIR/train.jsonl" ] || [ ! -f "$RAW_DIR/validation.jsonl" ]; then
     python scripts/fetch_hf.py \
       --dataset "$DATASET" \
       --config "$HF_CONFIG" \
       --train-docs "$TRAIN_DOCS" \
       --val-docs "$VAL_DOCS" \
-      --output "$DATA_DIR/raw"
+      --output "$RAW_DIR"
   fi
 
   if [ ! -f "$DATA_DIR/tokenizer/tokenizer.json" ]; then
-    head -n "$TOKENIZER_DOCS" "$DATA_DIR/raw/train.jsonl" > /tmp/kestrel_tok_train.jsonl
+    head -n "$TOKENIZER_DOCS" "$RAW_DIR/train.jsonl" > /tmp/kestrel_tok_train.jsonl
     python -m kestrel tokenizer \
       --train /tmp/kestrel_tok_train.jsonl \
       --output "$DATA_DIR/tokenizer" \
@@ -51,8 +54,8 @@ if [ ! -f "$DATA_DIR/encoded/manifest.json" ]; then
   fi
 
   python -m kestrel prepare \
-    --train "$DATA_DIR/raw/train.jsonl" \
-    --validation "$DATA_DIR/raw/validation.jsonl" \
+    --train "$RAW_DIR/train.jsonl" \
+    --validation "$RAW_DIR/validation.jsonl" \
     --tokenizer "$DATA_DIR/tokenizer" \
     --output "$DATA_DIR/encoded"
 fi

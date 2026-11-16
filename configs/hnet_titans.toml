@@ -41,10 +41,12 @@ num_loops = 3
 coda_layers = 1
 
 [train]
+# 8 x 4 fits an L4 (22 GB) at early router rates: 20.8 GB peak at 2048 chunks per row.
+# 16 x 2 runs out of memory there. One config for both GPUs keeps a run resumable on either.
 steps = 25000
-batch_size = 16
+batch_size = 8
 sequence_length = 4096
-gradient_accumulation = 2
+gradient_accumulation = 4
 warmup_steps = 500
 decay_steps = 5000
 muon_lr = 0.02

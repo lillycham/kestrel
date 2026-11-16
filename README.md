@@ -159,7 +159,22 @@ The default time budget is 600 seconds, checked between steps. It cannot interru
 For the full training run, set the chosen options in `[train]`. The existing resume check still requires an identical config.
 The current 25,000-step configs process 3.277 billion byte tokens. A 12-hour total permits less than 1.73 seconds per step before overhead.
 Target 1.5 seconds or less to leave time for compilation, evaluation and checkpoint writes.
-No L4 speedup for these changes has been measured yet.
+
+`compile = true` also compiles the main network per layer, with a dynamic chunk dimension.
+Each Titans block compiles as two regions around its memory loop; the loop stays in Python.
+On an L4 with `configs/hnet_titans.toml` at 8 x 4 batches, a step takes 1.79 s at 683 chunks per row and 5.49 s at 2048.
+At 2048 chunks, peak memory is 20.8 GB. A batch of 16 x 2 runs out of memory at early router rates.
+A full run thus takes about 13 hours on an L4. With `compile = true`, `metrics.jsonl` records `compiled_graphs`.
+This value must stop after the first few hundred steps. A steady rise shows recompilation on most steps.
+
+### Colab runs
+
+`scripts/colab_hnet.sh L4` (or `A100`) starts or resumes the `hnet_titans.toml` run with the `colab` CLI (`google-colab-cli`).
+It uses the committed HEAD. Data, checkpoints and a console log go to `MyDrive/kestrel` on Google Drive.
+The script stops and asks you to run `colab drivemount` if Drive is not mounted, because that step needs a browser.
+The first start makes byte-level data from the raw JSONL in `MyDrive/kestrel/data/raw`.
+Both GPUs use the same config, so a run that Colab reclaims can resume on either GPU.
+Stop the VM with `colab stop` after the run, because an idle VM still uses compute units.
 
 ## Sample
 
