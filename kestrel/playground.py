@@ -9,7 +9,7 @@ Titans model counts each run of a block as its own layer, in the order they run.
 
 An H-Net run shows its byte layers only: the encoder, then the decoder. The logit lens
 reads the encoder layers through the final norm too, although the model itself never
-does.
+does. Its Chunks view shows where the router splits the bytes into chunks.
 """
 from contextlib import contextmanager
 from pathlib import Path
@@ -75,6 +75,7 @@ class KestrelBackend:
         self.head_dim, self.context, self.vocab = c.head_dim, c.max_position_embeddings, len(tokenizer)
         self.params = sum(p.numel() for p in model.parameters())
         if self.hnet:
+            self.capabilities = KestrelBackend.capabilities | {"chunks"}
             main = "Titans-MAG" if c.main_network == "titans" else "Qwen3"
             self.shape = (f"H-Net ({main} main, width {c.main_hidden_size}, ~{c.target_chunk_size:g} bytes/chunk), "
                           f"{len(model.encoder)} + {len(model.decoder)} byte layers x {self.heads} heads "
@@ -176,6 +177,11 @@ class KestrelBackend:
             if "resid" in want:
                 add(self.embed.register_forward_hook(lambda m, args, out: visit("resid", 0, out[0])))
             self.model(torch.tensor([ids], device=self.device), use_cache=False)
+
+    def chunks(self, ids):
+        """The H-Net router on ids: each byte's boundary probability, and whether it starts a chunk."""
+        out = self.model(torch.tensor([ids], device=self.device), use_cache=False)
+        return out.boundary_probs[0], out.boundaries[0]
 
     @contextmanager
     def ablated(self, heads):

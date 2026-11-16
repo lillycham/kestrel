@@ -314,7 +314,7 @@ class HNetForCausalLM(nn.Module):
             "padded_chunks_per_row": chunks.shape[1],
             "chunk_padding_fraction": 1 - valid.float().mean(),
         }
-        return SimpleNamespace(logits=logits, aux_loss=self.ratio_loss_weight * aux, boundaries=b)
+        return SimpleNamespace(logits=logits, aux_loss=self.ratio_loss_weight * aux, boundaries=b, boundary_probs=p)
 
     def _forward_cached(self, input_ids, cache, logits_to_keep=0):
         """Continue from the bytes that the cache dict holds; fill it on the first call.
@@ -361,7 +361,7 @@ class HNetForCausalLM(nn.Module):
         cache["pos"] = start + length
         if logits_to_keep:
             x = x[:, -logits_to_keep:]
-        return SimpleNamespace(logits=self.lm_head(self.norm(x)), boundaries=b)
+        return SimpleNamespace(logits=self.lm_head(self.norm(x)), boundaries=b, boundary_probs=p)
 
     @torch.no_grad()
     def generate(self, input_ids, use_cache=True, **kwargs):

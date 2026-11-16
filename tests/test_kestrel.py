@@ -624,6 +624,7 @@ def test_playground_hnet_backend(tmp_path, main):
 
     backend = KestrelBackend(tmp_path / "latest.pt", tmp_path / "tokenizer", torch.device("cpu"))
     assert backend.hnet and backend.layers == cfg["encoder_layers"] + cfg["decoder_layers"]
+    assert "chunks" in backend.capabilities
     assert backend.shape.startswith("H-Net")
     ids = backend.prompt("text", {"text": "playground doc", "after_eot": True}).ids
     assert len(ids) == 1 + len(b"playground doc")
@@ -640,6 +641,10 @@ def test_playground_hnet_backend(tmp_path, main):
     views.head_map(backend, ids)
     _, active, _, _ = views.neuron_map(backend, ids, 0, 0, len(ids))
     assert len(active) == backend.layers
+    p, starts = backend.chunks(ids)
+    assert p.shape == starts.shape == (len(ids),) and starts[0] and torch.equal(starts, p >= 0.5)
+    with torch.no_grad():
+        torch.testing.assert_close(starts, model(torch.tensor([ids])).boundaries[0])
 
     # Cached sampling matches uncached, past the context too, with heads off or not.
     prompt = Prompt(ids)
