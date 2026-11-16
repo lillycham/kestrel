@@ -34,14 +34,17 @@ def read_config(path):
         "warmup_steps", "decay_steps", "muon_lr", "adamw_lr", "weight_decay",
         "clip_norm", "eval_every", "eval_batches", "save_every", "seed",
     }
-    optional_train = {"precision", "compile", "assistant_only", "keep_checkpoints", "gradient_checkpointing"}
+    optional_train = {"precision", "compile", "assistant_only", "keep_checkpoints", "gradient_checkpointing", "attention_backend", "hnet_smoothing", "batched_muon"}
     if set(train) - (required_train | optional_train) or required_train - set(train):
         raise ValueError(f"Train options differ: {set(train) ^ required_train}")
     if "precision" in train and train["precision"] not in {"fp32", "bf16", "auto"}:
         raise ValueError("precision must be 'fp32', 'bf16' or 'auto'")
-    for flag in ("compile", "assistant_only", "keep_checkpoints", "gradient_checkpointing"):
+    for flag in ("compile", "assistant_only", "keep_checkpoints", "gradient_checkpointing", "batched_muon"):
         if flag in train and not isinstance(train[flag], bool):
             raise ValueError(f"{flag} must be a boolean")
+    for option, choices in (("attention_backend", {"sdpa", "flash2"}), ("hnet_smoothing", {"blocked", "dense"})):
+        if option in train and train[option] not in choices:
+            raise ValueError(f"{option} must be one of {sorted(choices)}")
     for name in ("steps", "batch_size", "sequence_length", "gradient_accumulation",
                  "eval_every", "eval_batches", "save_every"):
         if not isinstance(train[name], int) or train[name] <= 0:
@@ -215,9 +218,12 @@ def make_optimizers(model, train):
         rest = [p for p in params if multiplier == 1.0 or id(p) in inner]
         return [{"params": ps, "lr": lr * m, **extra} for ps, m in ((rest, 1.0), (outer, multiplier)) if ps]
 
-    muon = torch.optim.Muon(
+    from .performance import BatchedMuon
+    muon_type = BatchedMuon if train.get("batched_muon", False) else torch.optim.Muon
+    muon_options = {"compile_kernel": train.get("compile", False)} if train.get("batched_muon", False) else {}
+    muon = muon_type(
         groups(matrices, train["muon_lr"]), lr=train["muon_lr"], weight_decay=train["weight_decay"],
-        adjust_lr_fn="original",
+        adjust_lr_fn="original", **muon_options,
     )
     adam = torch.optim.AdamW(
         groups(decay, train["adamw_lr"], weight_decay=train["weight_decay"])

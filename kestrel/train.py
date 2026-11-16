@@ -3,6 +3,7 @@
 from contextlib import nullcontext
 from functools import partial
 import json
+import math
 import os
 import shutil
 import time
@@ -13,6 +14,7 @@ import torch
 
 from .core import choose_device, make_model, make_optimizers, read_config, resolve_precision, wsd
 from .data import load_data, load_tokenizer
+from .performance import configure_training
 
 
 def mask_assistant_targets(stream, starts, tokens, assistant_id, end_id, non_assistant_ids):
@@ -60,17 +62,20 @@ def batch(stream, settings, generator, device, assistant_tokens=None):
     return x, y.to(device, non_blocking=True)
 
 
-def loss_on(model, x, y, autocast_ctx=nullcontext, aux=True):
+def loss_on(model, x, y, autocast_ctx=nullcontext, aux=True, masked=True):
     """Cross-entropy, plus the model's auxiliary loss (the H-Net ratio loss) when aux is true."""
     # Shift explicitly so we supervise every position in each sampled block.
     with autocast_ctx():
         output = model(input_ids=x, use_cache=False)
         logits = output.logits
         extra = getattr(output, "aux_loss", None) if aux else None
-        if (y != -100).sum() == 0:
-            loss = logits.sum() * 0.0
+        if masked:
+            # Empty assistant spans yield zero loss and zero gradients without
+            # a device-to-host branch on every microbatch.
+            loss = torch.nn.functional.cross_entropy(logits.flatten(0, 1), y.flatten(), ignore_index=-100, reduction="sum")
+            loss = loss / (y != -100).sum().clamp_min(1)
         else:
-            loss = torch.nn.functional.cross_entropy(logits.flatten(0, 1), y.flatten(), ignore_index=-100)
+            loss = torch.nn.functional.cross_entropy(logits.flatten(0, 1), y.flatten())
         return loss if extra is None else loss + extra
 
 
@@ -78,7 +83,7 @@ def loss_on(model, x, y, autocast_ctx=nullcontext, aux=True):
 def evaluate(model, stream, settings, device, autocast_ctx=nullcontext, assistant_tokens=None):
     generator = torch.Generator().manual_seed(settings["seed"] + 1)
     model.eval()
-    losses = [loss_on(model, *batch(stream, settings, generator, device, assistant_tokens), autocast_ctx, aux=False).item()
+    losses = [loss_on(model, *batch(stream, settings, generator, device, assistant_tokens), autocast_ctx, aux=False, masked=assistant_tokens is not None).item()
               for _ in range(settings["eval_batches"])]
     model.train()
     return sum(losses) / len(losses)
@@ -130,6 +135,7 @@ def train(config_path, data_path, output, requested_device="auto", resume=False,
             raw_model.set_gradient_checkpointing(True)
         else:
             raw_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    configure_training(raw_model, settings)
     optimizers = make_optimizers(raw_model, settings)
     output = Path(output)
     start = 0
@@ -187,21 +193,31 @@ def train(config_path, data_path, output, requested_device="auto", resume=False,
             optimizer.zero_grad(set_to_none=True)
             for group in optimizer.param_groups:
                 group["lr"] = group["base_lr"] * scale
-        total_loss = 0.0
+        step_started = time.monotonic()
+        total_loss = torch.zeros((), device=device)
         for _ in range(settings["gradient_accumulation"]):
-            loss = loss_on(model, *batch(train_tokens, settings, generator, device, assistant_tokens), autocast_ctx)
-            if not torch.isfinite(loss):
-                raise FloatingPointError(f"Nonfinite loss at step {step + 1}")
-            total_loss += loss.item() / settings["gradient_accumulation"]
+            loss = loss_on(model, *batch(train_tokens, settings, generator, device, assistant_tokens), autocast_ctx,
+                           masked=assistant_tokens is not None)
+            total_loss += loss.detach() / settings["gradient_accumulation"]
             (loss / settings["gradient_accumulation"]).backward()
+        total_loss = total_loss.item()
+        if not math.isfinite(total_loss):
+            raise FloatingPointError(f"Nonfinite loss at step {step + 1}")
         torch.nn.utils.clip_grad_norm_(raw_model.parameters(), settings["clip_norm"], error_if_nonfinite=True)
         for optimizer in optimizers:
             optimizer.step()
         done = step + 1
         record = {"step": done, "train_loss": total_loss, "lr_scale": scale}
         # H-Net chunk statistics from the last micro-batch (train_loss includes the ratio loss).
-        for key, value in getattr(raw_model, "last_stats", {}).items():
-            record[key] = float(value)
+        stats = getattr(raw_model, "last_stats", {})
+        if stats:
+            values = torch.stack([torch.as_tensor(v, device=device).detach().float() for v in stats.values()]).tolist()
+            record.update(zip(stats, values, strict=True))
+        # The scalar transfer above waits for the preceding optimizer work on
+        # H-Net. CUDA synchronize also covers models with no statistics.
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        record["train_step_seconds"] = time.monotonic() - step_started
         if done % settings["eval_every"] == 0 or done == end:
             record["validation_loss"] = evaluate(model, validation_tokens, settings, device, autocast_ctx, assistant_tokens)
         record["elapsed_seconds"] = time.monotonic() - started
@@ -230,6 +246,8 @@ def _load_for_inference(run, requested_device, seed):
         "pad_token_id": tokenizer.pad_token_id,
     }).to(device).eval()
     model.load_state_dict(saved["model"])
+    # Inference uses SDPA without autocast, but retains the chosen EMA formula.
+    configure_training(model, {**saved["config"]["train"], "attention_backend": "sdpa"})
     # Unused model output rows must never be sampled.
     unused = [[index] for index in range(len(tokenizer), model.config.vocab_size)]
     return model, tokenizer, device, unused or None

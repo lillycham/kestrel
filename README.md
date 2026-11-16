@@ -111,6 +111,56 @@ Generation runs the whole window again for each byte, because H-Net has no decod
 `gradient_checkpointing = true` in `[train]` recomputes each layer in the backward pass. It works for every model kind.
 For `configs/hnet.toml` at 2 x 4096 bytes on MPS, it cuts memory from 3.6 GB to 1.6 GB.
 
+### H-Net training performance
+
+`compile = true` compiles the fixed byte encoder and decoder. The variable-length main network stays eager.
+Titans shares compiled retrieval and update kernels across its memory layers. Each kernel processes one fixed-size memory chunk.
+The first and later updates can need separate graphs because their momentum tensors have different gradient requirements.
+A new router length does not require a new whole-main graph. Evaluation can require separate graphs too.
+Compilation no longer adds padding to multiples of 256. Rows still share the maximum chunk count in each batch.
+
+The default EMA uses 64-position blocks and a scan of block summaries. It avoids a sequence-sized square matrix.
+Its products and accumulation use FP32, including under BF16 autocast. This can change rounding relative to the old dense EMA.
+Use `hnet_smoothing = "dense"` under `[train]` to compare with the old formula.
+
+Two optional `[train]` settings support separate measurements:
+
+- `attention_backend = "flash2"` uses FlashAttention-2 for H-Net and Titans local attention. It requires CUDA, BF16/FP16, and `flash-attn`.
+  It preserves the local window and GQA. The transformer main network keeps its existing SDPA implementation.
+  `"sdpa"` remains the default. Cached generation uses the existing attention path.
+- `batched_muon = true` groups equal-shaped matrices within each optimizer group. Each matrix retains its own normalization and momentum.
+  The standard Muon checkpoint layout and stage learning rates stay unchanged. With `compile = true`, only the orthogonalization kernel compiles.
+  This option defaults to false until a device benchmark shows a benefit.
+
+These options do not change memory chunk size, loop count, or the training budget.
+The trainer reports `train_step_seconds`, `padded_chunks_per_row`, and `chunk_padding_fraction`.
+Step time includes any compilation for that step, but excludes evaluation and checkpoint writes.
+The loss check occurs once per optimizer step, before the optimizer can update parameters. Gradient checks remain enabled.
+
+Use a short synthetic benchmark before a full L4 run:
+
+```sh
+TORCH_LOGS=recompiles,graph_breaks nix develop -c python -m kestrel.benchmark \
+  --config configs/hnet_titans.toml --device cuda --compile fixed \
+  --chunk-counts 256,512,768,512,256 --steps-per-shape 3
+```
+
+Run this in an environment with a CUDA-enabled PyTorch build. The benchmark prints each step as JSON.
+It forces router lengths outside the compiled encoder. It retains the configured batch size and gradient accumulation.
+The first visit includes compilation costs; later steps and repeat visits show whether those costs recur.
+It uses synthetic data and boundaries, so its loss does not measure model quality.
+It does not load a checkpoint, save model weights, or access a dataset.
+
+Compare with `--compile off`, then test `--attention-backend flash2`, `--batched-muon`, and `--smoothing dense` separately.
+Compare `--batch-size 8 --accumulation 4` with `--batch-size 16 --accumulation 2` to keep the effective batch size fixed.
+`--trace /tmp/hnet-trace.json` writes a profiler trace with forward/backward and optimizer regions; profiling adds overhead.
+The default time budget is 600 seconds, checked between steps. It cannot interrupt a compiler call already in progress.
+
+For the full training run, set the chosen options in `[train]`. The existing resume check still requires an identical config.
+The current 25,000-step configs process 3.277 billion byte tokens. A 12-hour total permits less than 1.73 seconds per step before overhead.
+Target 1.5 seconds or less to leave time for compilation, evaluation and checkpoint writes.
+No L4 speedup for these changes has been measured yet.
+
 ## Sample
 
 ```sh

@@ -71,11 +71,11 @@ def downsample(h, b, bucket=0):
     return chunks, order, valid
 
 
-def smooth(z, p_chunk):
+def smooth_dense(z, p_chunk):
     """EMA over the chunk sequence: zbar_j = P_j z_j + (1 - P_j) zbar_{j-1}.
 
     Closed form zbar_j = sum_{i <= j} P_i prod_{i < m <= j} (1 - P_m) z_i, as an
-    (M, M) lower-triangular weight matrix. This is cheap at our chunk counts.
+    (M, M) lower-triangular weight matrix. Kept as a benchmark reference.
     P_0 = 1 for every row, so the clamp on log(1 - P) never changes the result.
     """
     p_chunk = p_chunk.float()
@@ -85,6 +85,41 @@ def smooth(z, p_chunk):
     causal = torch.ones(most, most, dtype=torch.bool, device=z.device).tril()
     weights = torch.exp(diff.masked_fill(~causal, float("-inf"))) * p_chunk[:, None, :]
     return torch.bmm(weights, z.float()).to(z.dtype)
+
+
+def smooth(z, p_chunk, block_size=64):
+    """Blockwise EMA with an associative scan of block summaries.
+
+    Each block computes its local EMA with a small triangular matrix. A scan
+    composes the affine maps (decay, final state) between blocks. No division
+    by cumulative products, and no sequence-sized quadratic matrix, is needed.
+    Keep the dense reference's 1e-6 retention floor, including at p == 1.
+    """
+    batch, length, width = z.shape
+    pad = (-length) % block_size
+    # FP32 accumulation also makes the carry across blocks stable under AMP.
+    with torch.autocast(device_type=z.device.type, enabled=False):
+        prob = F.pad(p_chunk.float(), (0, pad)).reshape(batch, -1, block_size)
+        values = F.pad(z.float(), (0, 0, 0, pad)).reshape(batch, -1, block_size, width)
+        keep = (1 - prob).clamp_min(1e-6)
+        pos = torch.arange(block_size, device=z.device)
+        after = pos[None, :] > pos[:, None]
+        # Rows are source positions; columns are destinations. Direct products
+        # avoid cancellation in gradients of differences of cumulative logs.
+        weights = torch.where(after, keep[..., None, :], 1.0).cumprod(-1)
+        weights = weights * (pos[None, :] >= pos[:, None]) * prob[..., :, None]
+        local = torch.matmul(weights.transpose(-1, -2), values)
+        retention = keep.cumprod(-1)
+        decay = retention[..., -1, None]
+        states = local[..., -1, :]
+        offset = 1
+        while offset < states.shape[1]:
+            states = torch.cat((states[:, :offset], states[:, offset:] + decay[:, offset:] * states[:, :-offset]), dim=1)
+            decay = torch.cat((decay[:, :offset], decay[:, offset:] * decay[:, :-offset]), dim=1)
+            offset *= 2
+        incoming = F.pad(states[:, :-1], (0, 0, 1, 0))
+        result = local + retention[..., None] * incoming[:, :, None, :]
+    return result.reshape(batch, -1, width)[:, :length].to(z.dtype)
 
 
 def upsample(zbar, b, p):
@@ -177,16 +212,20 @@ class HNetForCausalLM(nn.Module):
         self.gradient_checkpointing = False
         self.chunk_bucket = 0
         self._compiled_encode = None
-        self._compiled_main = None
         self._compiled_decode = None
+        self.smoothing = "blocked"
 
-    def compile_submodules(self):
-        """Compile whole encoder+router, main+smooth, and upsample+decoder+head paths."""
-        self.chunk_bucket = 256
-        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 32)
-        self._compiled_encode = torch.compile(self._encode_and_route)
-        self._compiled_main = torch.compile(self._run_main_and_smooth)
-        self._compiled_decode = torch.compile(self._upsample_and_decode)
+    def compile_submodules(self, **compile_options):
+        """Compile fixed byte stages and reusable, fixed-size memory operations.
+
+        Compaction, the variable-length main network, smoothing and
+        upsampling stay outside these graphs. A new chunk count must not
+        compile an unrolled copy of the entire Titans recurrence.
+        """
+        self._compiled_encode = torch.compile(self._encode_and_route, **compile_options)
+        self._compiled_decode = torch.compile(self._decode, **compile_options)
+        if isinstance(self.main, TitansMain):
+            self.main.model.compile_memory(**compile_options)
 
     def set_gradient_checkpointing(self, enabled):
         """Recompute each byte layer and main-network layer in the backward pass."""
@@ -218,10 +257,10 @@ class HNetForCausalLM(nn.Module):
 
     def _run_main_and_smooth(self, chunks, positions, p):
         z = self.down_proj(self.main(self.up_proj(chunks)))
-        return smooth(z, torch.gather(p, 1, positions))
+        smoothing = smooth if self.smoothing == "blocked" else smooth_dense
+        return smoothing(z, torch.gather(p, 1, positions))
 
-    def _upsample_and_decode(self, zbar, b, p, h, cos, sin, logits_to_keep):
-        x = upsample(zbar, b, p) + self.residual_proj(h)
+    def _decode(self, x, cos, sin, logits_to_keep):
         for layer in self.decoder:
             x = self._layer(layer, x, cos, sin)
         if logits_to_keep:
@@ -230,18 +269,20 @@ class HNetForCausalLM(nn.Module):
 
     def forward(self, input_ids, logits_to_keep=0, **kwargs):
         encode_fn = self._compiled_encode or self._encode_and_route
-        main_fn = self._compiled_main or self._run_main_and_smooth
-        decode_fn = self._compiled_decode or self._upsample_and_decode
+        decode_fn = self._compiled_decode or self._decode
 
         h, p, b, cos, sin, aux = encode_fn(input_ids)
         chunks, positions, valid = downsample(h, b, bucket=self.chunk_bucket)
-        zbar = main_fn(chunks, positions, p)
-        logits = decode_fn(zbar, b, p, h, cos, sin, logits_to_keep)
+        zbar = self._run_main_and_smooth(chunks, positions, p)
+        x = upsample(zbar, b, p) + self.residual_proj(h)
+        logits = decode_fn(x, cos, sin, logits_to_keep)
 
         self.last_stats = {
             "bytes_per_chunk": b.numel() / b.sum().clamp_min(1),
             "ratio_loss": aux.detach(),
             "chunks_per_row": valid.sum(dim=1).float().mean(),
+            "padded_chunks_per_row": chunks.shape[1],
+            "chunk_padding_fraction": 1 - valid.float().mean(),
         }
         return SimpleNamespace(logits=logits, aux_loss=self.ratio_loss_weight * aux, boundaries=b)
 

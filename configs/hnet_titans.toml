@@ -57,5 +57,5 @@ save_every = 1000
 keep_checkpoints = true
 seed = 42
 precision = "auto"
-# Buckets chunk length to multiples of 256 and compiles byte blocks + main network.
+# Compile fixed byte stages and shared memory operations; keep chunk-length loops eager.
 compile = true

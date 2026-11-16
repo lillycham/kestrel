@@ -47,5 +47,5 @@ save_every = 1000
 keep_checkpoints = true
 seed = 42
 precision = "auto"
-# The chunk count varies per batch, so torch.compile would recompile often.
+# Compilation isolates fixed byte stages from the variable chunk sequence.
 compile = false

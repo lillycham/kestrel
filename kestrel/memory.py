@@ -16,6 +16,27 @@ def _silu_and_grad(x):
     return silu, grad
 
 
+def memory_retrieve(qc, w1, w2):
+    return torch.bmm(F.silu(torch.bmm(qc, w1.transpose(1, 2))), w2.transpose(1, 2))
+
+
+def memory_update(state, kc, vc, a_i, e_i, t_i, chunk_size):
+    """One momentum step on the closed-form gradient of 0.5 / C * ||M(kc) - vc||^2."""
+    w1, w2, s1, s2 = state
+    hk = torch.bmm(kc, w1.transpose(1, 2))  # (B * H, C, m_h)
+    ak, dsilu = _silu_and_grad(hk)
+    pred = torch.bmm(ak, w2.transpose(1, 2))
+    err = (pred - vc) * (1.0 / chunk_size)  # (B * H, C, d_h)
+
+    gw2 = torch.bmm(err.transpose(1, 2), ak)  # (B * H, d_h, m_h)
+    dak = torch.bmm(err, w2) * dsilu          # (B * H, C, m_h)
+    gw1 = torch.bmm(dak.transpose(1, 2), kc)  # (B * H, m_h, d_h)
+
+    s1 = e_i * s1 - t_i * gw1
+    s2 = e_i * s2 - t_i * gw2
+    return (1.0 - a_i) * w1 + s1, (1.0 - a_i) * w2 + s2, s1, s2
+
+
 class NeuralMemory(nn.Module):
     """Two-layer fast-weight MLP memory updated per chunk via closed-form MSE gradients."""
 
@@ -29,6 +50,8 @@ class NeuralMemory(nn.Module):
         self.mem_head_dim = memory_hidden_size // heads
         self.forget_bias = forget_bias
         self.min_forget = min_forget
+        self._compiled_retrieve = None
+        self._compiled_update = None
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
@@ -64,25 +87,17 @@ class NeuralMemory(nn.Module):
         w2 = w2_base.float().unsqueeze(0).expand(bsz, -1, -1, -1).reshape(bsz * self.heads, self.head_dim, self.mem_head_dim).clone()
         return w1, w2, torch.zeros_like(w1), torch.zeros_like(w2)
 
-    @staticmethod
-    def _retrieve(qc, w1, w2):
-        return torch.bmm(F.silu(torch.bmm(qc, w1.transpose(1, 2))), w2.transpose(1, 2))
+    def _retrieve(self, qc, w1, w2):
+        if self._compiled_retrieve is None:
+            return memory_retrieve(qc, w1, w2)
+        # Chunk slices otherwise carry a stride that changes with sequence length.
+        return self._compiled_retrieve(qc.contiguous(), w1, w2)
 
     def _update(self, state, kc, vc, a_i, e_i, t_i):
-        """One momentum step on the closed-form gradient of 0.5 / C * ||M(kc) - vc||^2."""
-        w1, w2, s1, s2 = state
-        hk = torch.bmm(kc, w1.transpose(1, 2))  # (B * H, C, m_h)
-        ak, dsilu = _silu_and_grad(hk)
-        pred = torch.bmm(ak, w2.transpose(1, 2))
-        err = (pred - vc) * (1.0 / self.chunk_size)  # (B * H, C, d_h)
-
-        gw2 = torch.bmm(err.transpose(1, 2), ak)  # (B * H, d_h, m_h)
-        dak = torch.bmm(err, w2) * dsilu          # (B * H, C, m_h)
-        gw1 = torch.bmm(dak.transpose(1, 2), kc)  # (B * H, m_h, d_h)
-
-        s1 = e_i * s1 - t_i * gw1
-        s2 = e_i * s2 - t_i * gw2
-        return (1.0 - a_i) * w1 + s1, (1.0 - a_i) * w2 + s2, s1, s2
+        if self._compiled_update is None:
+            return memory_update(state, kc, vc, a_i, e_i, t_i, self.chunk_size)
+        return self._compiled_update(state, kc.contiguous(), vc.contiguous(), a_i.contiguous(),
+                                     e_i.contiguous(), t_i.contiguous(), self.chunk_size)
 
     def forward(self, x, cache=None):
         if cache is not None:
@@ -164,6 +179,7 @@ class SlidingWindowAttention(nn.Module):
         self.num_kv_groups = self.num_heads // self.num_kv_heads
         self.head_dim = config.head_dim
         self.window = config.attention_window
+        self.flash_attention = None
 
         self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
@@ -178,6 +194,13 @@ class SlidingWindowAttention(nn.Module):
         k = self.k_norm(self.k_proj(x).view(bsz, seq_len, self.num_kv_heads, self.head_dim)).transpose(1, 2)
         v = self.v_proj(x).view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        if self.flash_attention is not None and cache is None:
+            # Native GQA avoids both KV head expansion and overlapping KV blocks.
+            if not x.is_cuda or q.dtype not in (torch.float16, torch.bfloat16):
+                raise ValueError("flash2 attention requires CUDA and FP16 or BF16 autocast")
+            attn = self.flash_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                                        causal=True, window_size=(self.window - 1, 0), dropout_p=0.0)
+            return self.o_proj(attn.reshape(bsz, seq_len, -1))
         if cache is not None:
             # Keys and values are stored after QK-norm and RoPE. RoPE is relative,
             # so the cache only needs the last window - 1 positions.
@@ -341,8 +364,9 @@ class TitansMAGForCausalLM(nn.Module):
                 x = run(layer, x)
         if self.num_loops > 1:
             x0_normed = self.loop_x0_norm(x)
+            injection = self.loop_inject(x0_normed)
             for loop_idx in range(self.num_loops):
-                x = x + self.loop_inject(x0_normed) + self.loop_embed[loop_idx]
+                x = x + injection + self.loop_embed[loop_idx]
                 for layer in self.layers:
                     x = run(layer, x)
         else:
@@ -359,6 +383,16 @@ class TitansMAGForCausalLM(nn.Module):
             x = x[:, -logits_to_keep:]
         logits = self.lm_head(self.norm(x))
         return SimpleNamespace(logits=logits)
+
+    def compile_memory(self, **compile_options):
+        # Share the same callables across all layers. Neither function captures a
+        # layer instance or the variable number of chunks.
+        retrieve = torch.compile(memory_retrieve, **compile_options)
+        update = torch.compile(memory_update, **compile_options)
+        for module in self.modules():
+            if isinstance(module, NeuralMemory):
+                module._compiled_retrieve = retrieve
+                module._compiled_update = update
 
     def set_gradient_checkpointing(self, enabled):
         """Recompute each block in the backward pass instead of storing its activations."""
