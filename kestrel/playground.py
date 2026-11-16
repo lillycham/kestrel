@@ -6,6 +6,10 @@
 Every run folder with latest.pt and tokenizer/ is a model. Its step_*.pt snapshots are
 listed after the runs. Plain Qwen3 runs and Titans-MAG runs have every view. A looped
 Titans model counts each run of a block as its own layer, in the order they run.
+
+An H-Net run shows its byte layers only: the encoder, then the decoder. The logit lens
+reads the encoder layers through the final norm too, although the model itself never
+does. Generation runs the whole prefix again at each byte, as there is no decode cache.
 """
 from contextlib import contextmanager
 from pathlib import Path
@@ -17,6 +21,7 @@ from suzunaan.hooks import Counter, hooks, qk_attention, zero_heads
 
 from .core import make_model
 from .data import load_tokenizer
+from .hnet import HNetForCausalLM
 from .memory import TitansMAGForCausalLM
 
 
@@ -49,7 +54,10 @@ class KestrelBackend:
         self.model = model.to(device).eval()
         c = model.config
         self.titans = isinstance(model, TitansMAGForCausalLM)
-        inner = model if self.titans else model.model
+        self.hnet = isinstance(model, HNetForCausalLM)
+        # Titans and the H-Net byte layers call SlidingWindowAttention(h, cos, sin).
+        self.windowed = self.titans or self.hnet
+        inner = model if self.windowed else model.model
         self.embed, self.norm, self.head = inner.embed_tokens, inner.norm, model.lm_head
         # The blocks in the order they run (a looped core runs num_loops times), and
         # each distinct block once, for hooks.
@@ -57,15 +65,27 @@ class KestrelBackend:
             prelude, coda = list(getattr(model, "prelude", [])), list(getattr(model, "coda", []))
             self.runs = prelude + list(model.layers) * model.num_loops + coda
             self.blocks = prelude + list(model.layers) + coda
+        elif self.hnet:
+            # Only the byte layers: the main network runs on chunks, so its attention
+            # and residual stream have no row per token for the views.
+            self.runs = self.blocks = list(model.encoder) + list(model.decoder)
         else:
             self.runs = self.blocks = list(inner.layers)
         self.layers, self.heads = len(self.runs), c.num_attention_heads
         self.head_dim, self.context, self.vocab = c.head_dim, c.max_position_embeddings, len(tokenizer)
         self.params = sum(p.numel() for p in model.parameters())
-        kind = "Titans-MAG" if self.titans else "Qwen3"
-        loops = f", {model.num_loops} loops" if self.titans and model.num_loops > 1 else ""
-        self.shape = (f"{kind}, {self.layers} layers{loops} x {self.heads} heads ({c.num_key_value_heads} KV), "
-                      f"width {c.hidden_size}, context {self.context}")
+        if self.hnet:
+            # The H-Net has no decode cache yet: each step runs the whole prefix again.
+            self.decoder = None
+            main = "Titans-MAG" if c.main_network == "titans" else "Qwen3"
+            self.shape = (f"H-Net ({main} main, width {c.main_hidden_size}, ~{c.target_chunk_size:g} bytes/chunk), "
+                          f"{len(model.encoder)} + {len(model.decoder)} byte layers x {self.heads} heads "
+                          f"({c.num_key_value_heads} KV), width {c.hidden_size}, context {self.context} bytes")
+        else:
+            kind = "Titans-MAG" if self.titans else "Qwen3"
+            loops = f", {model.num_loops} loops" if self.titans and model.num_loops > 1 else ""
+            self.shape = (f"{kind}, {self.layers} layers{loops} x {self.heads} heads ({c.num_key_value_heads} KV), "
+                          f"width {c.hidden_size}, context {self.context}")
         self.unused = torch.arange(len(tokenizer), c.vocab_size, device=device)
 
         self.special = set(tokenizer.all_special_ids) | set(tokenizer.get_added_vocab().values())
@@ -136,7 +156,7 @@ class KestrelBackend:
         counters = {k: Counter() for k in ("resid", "attn", "mlp")}
 
         def attn_hook(module, args, kwargs, out):
-            if self.titans:
+            if self.windowed:
                 h, cos, sin = args
                 window = module.window
             else:
