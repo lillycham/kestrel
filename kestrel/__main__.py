@@ -1,7 +1,7 @@
 import argparse
 import json
 
-from .core import make_model, read_config
+from .core import choose_device, make_model, read_config
 from .data import prepare, train_tokenizer
 from .train import chat, sample, train
 
@@ -49,6 +49,10 @@ def main():
     interactive.add_argument("--repetition-penalty", type=float, default=1.1)
     interactive.add_argument("--system")
     interactive.add_argument("--seed", type=int, default=42)
+    playground = sub.add_parser("playground", help="Write, chat, compare and look inside runs in the browser")
+    playground.add_argument("--root", default="runs")
+    playground.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
+    playground.add_argument("--port", type=int, default=8000)
     args = vars(parser.parse_args())
     command = args.pop("command")
     if command == "inspect":
@@ -67,6 +71,11 @@ def main():
         sample(args["run"], args["prompt"], args["device"], args["max_new_tokens"],
                args["temperature"], args["seed"], args["top_k"], args["top_p"], args["raw"],
                args["repetition_penalty"])
+    elif command == "playground":
+        # Imported here: suzunaan is only needed for this command.
+        from suzunaan import serve
+        from .playground import catalog
+        serve(catalog(args["root"]), choose_device(args["device"]), args["port"])
     else:
         chat(args["run"], args["device"], args["max_new_tokens"], args["temperature"],
              args["seed"], args["top_k"], args["top_p"], args["system"], args["repetition_penalty"])
