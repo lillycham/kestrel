@@ -60,20 +60,25 @@ def batch(stream, settings, generator, device, assistant_tokens=None):
     return x, y.to(device, non_blocking=True)
 
 
-def loss_on(model, x, y, autocast_ctx=nullcontext):
+def loss_on(model, x, y, autocast_ctx=nullcontext, aux=True):
+    """Cross-entropy, plus the model's auxiliary loss (the H-Net ratio loss) when aux is true."""
     # Shift explicitly so we supervise every position in each sampled block.
     with autocast_ctx():
-        logits = model(input_ids=x, use_cache=False).logits
+        output = model(input_ids=x, use_cache=False)
+        logits = output.logits
+        extra = getattr(output, "aux_loss", None) if aux else None
         if (y != -100).sum() == 0:
-            return logits.sum() * 0.0
-        return torch.nn.functional.cross_entropy(logits.flatten(0, 1), y.flatten(), ignore_index=-100)
+            loss = logits.sum() * 0.0
+        else:
+            loss = torch.nn.functional.cross_entropy(logits.flatten(0, 1), y.flatten(), ignore_index=-100)
+        return loss if extra is None else loss + extra
 
 
 @torch.no_grad()
 def evaluate(model, stream, settings, device, autocast_ctx=nullcontext, assistant_tokens=None):
     generator = torch.Generator().manual_seed(settings["seed"] + 1)
     model.eval()
-    losses = [loss_on(model, *batch(stream, settings, generator, device, assistant_tokens), autocast_ctx).item()
+    losses = [loss_on(model, *batch(stream, settings, generator, device, assistant_tokens), autocast_ctx, aux=False).item()
               for _ in range(settings["eval_batches"])]
     model.train()
     return sum(losses) / len(losses)
@@ -185,6 +190,9 @@ def train(config_path, data_path, output, requested_device="auto", resume=False,
             optimizer.step()
         done = step + 1
         record = {"step": done, "train_loss": total_loss, "lr_scale": scale}
+        # H-Net chunk statistics from the last micro-batch (train_loss includes the ratio loss).
+        for key, value in getattr(raw_model, "last_stats", {}).items():
+            record[key] = float(value)
         if done % settings["eval_every"] == 0 or done == end:
             record["validation_loss"] = evaluate(model, validation_tokens, settings, device, autocast_ctx, assistant_tokens)
         record["elapsed_seconds"] = time.monotonic() - started

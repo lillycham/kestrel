@@ -274,15 +274,18 @@ class TitansMAGForCausalLM(nn.Module):
     def get_output_embeddings(self):
         return self.lm_head
 
-    def forward(self, input_ids, cache=None, logits_to_keep=0, **kwargs):
+    def forward(self, input_ids=None, cache=None, logits_to_keep=0, inputs_embeds=None, hidden_only=False, **kwargs):
         """Run the model. With a cache dict, continue from the tokens that it holds.
 
         The cache is a plain dict that this method fills on the first call. Each
         block call (prelude, every loop of the core, coda) gets its own entry.
+        With inputs_embeds and hidden_only (the H-Net main network), it maps
+        vectors to final-normed vectors and never uses the embedding or head.
         """
-        x = self.embed_tokens(input_ids)
+        x = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         offset = 0 if cache is None else cache.get("pos", 0)
-        pos_ids = torch.arange(offset, offset + input_ids.shape[1], device=input_ids.device).unsqueeze(0)
+        seq_len = x.shape[1]
+        pos_ids = torch.arange(offset, offset + seq_len, device=x.device).unsqueeze(0)
         cos, sin = self.rotary_emb(x, pos_ids)
         layer_caches = None if cache is None else iter(cache.setdefault("layers", [{} for _ in range(self._block_calls())]))
 
@@ -305,7 +308,9 @@ class TitansMAGForCausalLM(nn.Module):
             for layer in self.coda:
                 x = run(layer, x)
         if cache is not None:
-            cache["pos"] = offset + input_ids.shape[1]
+            cache["pos"] = offset + seq_len
+        if hidden_only:
+            return self.norm(x)
         if logits_to_keep:
             x = x[:, -logits_to_keep:]
         logits = self.lm_head(self.norm(x))

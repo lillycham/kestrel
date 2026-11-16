@@ -24,6 +24,8 @@ def read_config(path):
         "memory_chunk_size", "memory_hidden_size", "attention_window",
         "memory_heads", "memory_forget_bias", "memory_min_forget", "norm_attn_branch",
         "num_loops", "prelude_layers", "coda_layers",
+        "architecture", "encoder_layers", "decoder_layers", "target_chunk_size",
+        "ratio_loss_weight", "main",
     }
     if set(model) - allowed_model:
         raise ValueError(f"Unknown model options: {set(model) - allowed_model}")
@@ -60,6 +62,13 @@ def read_config(path):
 
 def make_model(settings, special_ids=None):
     settings = dict(settings)
+    architecture = settings.pop("architecture", "decoder")
+    if architecture == "hnet":
+        return make_hnet(settings, special_ids)
+    if architecture != "decoder":
+        raise ValueError("architecture must be 'decoder' or 'hnet'")
+    if HNET_KEYS & set(settings):
+        raise ValueError(f"H-Net options need architecture = 'hnet': {HNET_KEYS & set(settings)}")
     theta = settings.pop("rope_theta", 10000.0)
     memory_chunk = settings.pop("memory_chunk_size", None)
     memory_hidden = settings.pop("memory_hidden_size", None)
@@ -111,6 +120,69 @@ def make_model(settings, special_ids=None):
         raise ValueError("Looped and memory options require memory_chunk_size, memory_hidden_size, and attention_window")
     config._attn_implementation = "sdpa"
     return Qwen3ForCausalLM(config)
+
+
+HNET_KEYS = {"encoder_layers", "decoder_layers", "target_chunk_size", "ratio_loss_weight", "main"}
+TITANS_KEYS = {
+    "memory_chunk_size", "memory_hidden_size", "memory_heads", "memory_forget_bias",
+    "memory_min_forget", "norm_attn_branch", "num_loops", "prelude_layers", "coda_layers",
+}
+
+
+def make_hnet(settings, special_ids=None):
+    """Build a one-stage H-Net. [model] holds the byte-level shape; [model.main] the chunk-level network."""
+    from .hnet import HNetForCausalLM, QwenMain, TitansMain
+
+    if HNET_KEYS - set(settings):
+        raise ValueError(f"H-Net needs options: {HNET_KEYS - set(settings)}")
+    if TITANS_KEYS & set(settings) or "num_hidden_layers" in settings:
+        raise ValueError("Put main-network layers and memory options under [model.main]")
+    main = dict(settings.pop("main"))
+    network = main.pop("network", "transformer")
+    hnet = {key: settings.pop(key) for key in sorted(HNET_KEYS - {"main"})}
+    for key in ("encoder_layers", "decoder_layers"):
+        if not isinstance(hnet[key], int) or hnet[key] < 1:
+            raise ValueError(f"{key} must be a positive integer")
+    if not hnet["target_chunk_size"] > 1 or not math.isfinite(hnet["target_chunk_size"]):
+        raise ValueError("target_chunk_size must be finite and greater than 1")
+    if not math.isfinite(hnet["ratio_loss_weight"]) or hnet["ratio_loss_weight"] < 0:
+        raise ValueError("ratio_loss_weight must be finite and nonnegative")
+    if network == "transformer" and TITANS_KEYS & set(main):
+        raise ValueError("Titans options need main network = 'titans'")
+    if network == "titans" and not {"memory_chunk_size", "memory_hidden_size", "attention_window"} <= set(main):
+        raise ValueError("A Titans main network needs memory_chunk_size, memory_hidden_size and attention_window")
+    if network not in {"transformer", "titans"}:
+        raise ValueError("main network must be 'transformer' or 'titans'")
+    if "vocab_size" in main or "max_position_embeddings" in main:
+        raise ValueError("The main network takes vocab_size and max_position_embeddings from [model]")
+    inherited = ("max_position_embeddings", "attention_bias", "attention_dropout", "rms_norm_eps", "rope_theta")
+    main_settings = {key: settings[key] for key in inherited if key in settings}
+    main_settings.update(vocab_size=1, tie_word_embeddings=True, **main)
+    lm = make_model(main_settings)
+    body = QwenMain(lm) if network == "transformer" else TitansMain(lm)
+
+    theta = settings.pop("rope_theta", 10000.0)
+    window = settings.pop("attention_window", None)
+    if not isinstance(window, int) or window <= 0:
+        raise ValueError("H-Net needs a positive attention_window for its byte layers")
+    width, heads, kv_heads = settings["hidden_size"], settings["num_attention_heads"], settings["num_key_value_heads"]
+    if min(width, heads, kv_heads) <= 0 or heads % kv_heads:
+        raise ValueError("Attention heads must be positive and divisible by KV heads")
+    if width != heads * settings["head_dim"] or settings["head_dim"] % 2:
+        raise ValueError("Use an even head_dim with hidden_size = heads * head_dim")
+    config = Qwen3Config(
+        **settings, **(special_ids or {}),
+        num_hidden_layers=hnet["encoder_layers"] + hnet["decoder_layers"],
+        rope_parameters={"rope_type": "default", "rope_theta": theta},
+        use_cache=False,
+    )
+    config.architecture = "hnet"
+    config.attention_window = window
+    config.main_network = network
+    config.main_hidden_size = main["hidden_size"]
+    for key, value in hnet.items():
+        setattr(config, key, value)
+    return HNetForCausalLM(config, body)
 
 
 def make_optimizers(model, train):

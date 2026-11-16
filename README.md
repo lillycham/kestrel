@@ -87,6 +87,25 @@ Each save atomically replaces `latest.pt`. Metrics append to `metrics.jsonl`.
 An interruption loses progress after the latest save. Configure `save_every` for the desired interval.
 The initial version does not retain checkpoint history or branch a new cooldown schedule.
 
+## Byte-level H-Net
+
+`architecture = "hnet"` selects a one-stage H-Net with dynamic chunking (Hwang, Wang and Gu, 2025).
+Sliding-window attention layers encode bytes. A router puts a chunk boundary where consecutive encoder states differ.
+The main network runs on the chunks. A smoothing step and a byte decoder then predict the next byte.
+`[model.main]` sets the main network: `network = "transformer"` (`configs/hnet.toml`) or `"titans"` (`configs/hnet_titans.toml`).
+
+Prepare the data with a byte tokenizer. A vocabulary of 263 holds the 256 bytes and the 7 control tokens, and has no merges:
+
+```sh
+python -m kestrel tokenizer --train data/train.jsonl --output data/bytes-tokenizer --vocab-size 263
+python -m kestrel prepare --train data/train.jsonl --validation data/validation.jsonl --tokenizer data/bytes-tokenizer --output data/bytes
+```
+
+`target_chunk_size` is the target number of bytes per chunk, and `ratio_loss_weight` scales the ratio loss.
+`train_loss` includes the ratio loss. `validation_loss` is cross-entropy per byte only.
+The metrics log also records `bytes_per_chunk`, `ratio_loss` and `chunks_per_row`.
+Generation runs the whole window again for each byte, because H-Net has no decode cache yet.
+
 ## Sample
 
 ```sh

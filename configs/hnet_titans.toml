@@ -1,0 +1,61 @@
+# Byte-level one-stage H-Net with a Looped Titans-MAG main network (the titans_loop.toml core).
+# Byte tokenizer: `python -m kestrel tokenizer ... --vocab-size 263` (256 bytes + 7 control tokens).
+# 4096 bytes is about the 1024 BPE tokens of titans_loop.toml. Not tuned: debug the router on an L4 first.
+[model]
+architecture = "hnet"
+vocab_size = 264
+hidden_size = 256
+intermediate_size = 704
+num_attention_heads = 4
+num_key_value_heads = 2
+head_dim = 64
+max_position_embeddings = 4096
+tie_word_embeddings = true
+attention_bias = false
+attention_dropout = 0.0
+rms_norm_eps = 0.000001
+rope_theta = 10000.0
+attention_window = 256
+encoder_layers = 4
+decoder_layers = 4
+target_chunk_size = 6.0
+ratio_loss_weight = 0.03
+
+[model.main]
+network = "titans"
+hidden_size = 512
+intermediate_size = 1408
+num_hidden_layers = 4
+num_attention_heads = 8
+num_key_value_heads = 2
+head_dim = 64
+memory_chunk_size = 64
+memory_hidden_size = 512
+memory_heads = 4
+memory_forget_bias = 0.0
+memory_min_forget = 0.02
+norm_attn_branch = true
+attention_window = 256
+prelude_layers = 1
+num_loops = 3
+coda_layers = 1
+
+[train]
+steps = 25000
+batch_size = 4
+sequence_length = 4096
+gradient_accumulation = 8
+warmup_steps = 500
+decay_steps = 5000
+muon_lr = 0.02
+adamw_lr = 0.001
+weight_decay = 0.01
+clip_norm = 1.0
+eval_every = 250
+eval_batches = 16
+save_every = 1000
+keep_checkpoints = true
+seed = 42
+precision = "auto"
+# The chunk count varies per batch, so torch.compile would recompile often.
+compile = false

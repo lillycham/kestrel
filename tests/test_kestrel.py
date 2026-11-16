@@ -489,3 +489,87 @@ def test_playground_cached_sample_is_the_uncached_sample(tmp_path, config, ablat
     backend.decoder = None
     assert run() == cached
     assert all(i < len(tok) for i in cached)              # the unused rows stay masked
+
+
+HNET_TITANS_MAIN = '''[model.main]
+network = "titans"
+hidden_size = 48
+intermediate_size = 96
+num_hidden_layers = 1
+num_attention_heads = 4
+num_key_value_heads = 2
+head_dim = 12
+memory_chunk_size = 4
+memory_hidden_size = 16
+attention_window = 8
+num_loops = 2
+'''
+
+
+def hnet_config(tmp_path, main):
+    text = (ROOT / "configs/hnet_smoke.toml").read_text()
+    if main == "titans":
+        start, end = text.index("[model.main]"), text.index("[train]")
+        text = text[:start] + HNET_TITANS_MAIN + "\n" + text[end:]
+    path = tmp_path / f"hnet_{main}.toml"
+    path.write_text(text)
+    return path
+
+
+def test_byte_tokenizer_has_no_merges(tmp_path):
+    training = tmp_path / "train.jsonl"
+    training.write_text("\n".join(json.dumps({"text": f"the the the {i}"}) for i in range(20)))
+    train_tokenizer(training, tmp_path / "bytes", 263)
+    tokenizer = load_tokenizer(tmp_path / "bytes")
+    assert len(tokenizer) == 263
+    text = "the café 🦉 1270"
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    assert len(ids) == len(text.encode("utf-8"))
+    assert tokenizer.decode(ids) == text
+
+
+def test_hnet_smoothing_and_ratio_loss():
+    from kestrel.hnet import ratio_loss, smooth
+
+    torch.manual_seed(0)
+    z = torch.randn(2, 6, 3)
+    p = torch.rand(2, 6) * 0.5 + 0.5
+    p[:, 0] = 1.0
+    expected, state = [], torch.zeros(2, 3)
+    for j in range(6):
+        state = p[:, j, None] * z[:, j] + (1 - p[:, j, None]) * state
+        expected.append(state)
+    torch.testing.assert_close(smooth(z, p), torch.stack(expected, dim=1))
+
+    b = torch.tensor([[True, False, False, False] * 4])
+    at_target = ratio_loss(torch.full((1, 16), 0.25), b, 4.0)
+    torch.testing.assert_close(at_target, torch.tensor(1.0))
+    assert ratio_loss(torch.full((1, 16), 0.9), torch.ones(1, 16, dtype=torch.bool), 4.0) > at_target
+
+
+@pytest.mark.parametrize("main", ["transformer", "titans"])
+def test_hnet_causality_and_train(tmp_path, main):
+    config_path = hnet_config(tmp_path, main)
+    model = make_model(read_config(config_path)["model"]).eval()
+    assert model.lm_head.weight is model.embed_tokens.weight
+    torch.manual_seed(1)
+    x = torch.randint(7, 263, (3, 40))
+    y = x.clone()
+    y[:, 20:] = torch.randint(7, 263, (3, 20))
+    with torch.no_grad():
+        a, b = model(x), model(y)
+    torch.testing.assert_close(a.logits[:, :20], b.logits[:, :20])
+    torch.testing.assert_close(a.boundaries[:, :20], b.boundaries[:, :20])
+    assert a.boundaries[:, 0].all()
+
+    training = tmp_path / "train.jsonl"
+    validation = tmp_path / "validation.jsonl"
+    training.write_text("\n".join(json.dumps({"text": f"long document {i} " * 8}) for i in range(12)))
+    validation.write_text("\n".join(json.dumps({"text": f"val document {i} " * 8}) for i in range(4)))
+    train_tokenizer(training, tmp_path / "tokenizer", 263)
+    prepare(training, validation, tmp_path / "tokenizer", tmp_path / "encoded")
+    train(config_path, tmp_path / "encoded", tmp_path / "run", "cpu")
+    records = [json.loads(line) for line in (tmp_path / "run/metrics.jsonl").read_text().splitlines()]
+    assert all(r["bytes_per_chunk"] >= 1 and "ratio_loss" in r for r in records)
+    assert any("validation_loss" in r for r in records)
+    sample(tmp_path / "run", "long", max_new_tokens=4, temperature=0, raw=True)
