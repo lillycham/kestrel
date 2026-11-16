@@ -146,6 +146,16 @@ class QwenMain(nn.Module):
     def forward(self, x):
         return self.model(inputs_embeds=x, use_cache=False).last_hidden_state
 
+    def compile_layers(self, **compile_options):
+        """Compile each decoder layer; the layers share graphs.
+
+        The first new chunk count makes the length dimension dynamic, so later
+        counts reuse that graph. The model body stays eager: compiled, it would
+        build a full causal mask instead of letting SDPA use its causal kernel.
+        """
+        for layer in self.model.layers:
+            layer.forward = torch.compile(layer.forward, **compile_options)
+
     def set_gradient_checkpointing(self, enabled):
         if enabled:
             # Transformers warns that gradients cannot reach the (removed) token
@@ -171,6 +181,9 @@ class TitansMain(nn.Module):
 
     def forward(self, x):
         return self.model(inputs_embeds=x, hidden_only=True)
+
+    def compile_layers(self, **compile_options):
+        self.model.compile_blocks(**compile_options)
 
     def set_gradient_checkpointing(self, enabled):
         self.model.set_gradient_checkpointing(enabled)
@@ -216,16 +229,17 @@ class HNetForCausalLM(nn.Module):
         self.smoothing = "blocked"
 
     def compile_submodules(self, **compile_options):
-        """Compile fixed byte stages and reusable, fixed-size memory operations.
+        """Compile the fixed byte stages, and the main network for any chunk count.
 
-        Compaction, the variable-length main network, smoothing and
-        upsampling stay outside these graphs. A new chunk count must not
-        compile an unrolled copy of the entire Titans recurrence.
+        Compaction, smoothing and upsampling stay outside these graphs. The
+        main network compiles per layer with a dynamic chunk dimension, so a
+        new chunk count reuses its graphs. A Titans main network keeps its
+        chunk recurrence in Python: a new chunk count must not compile an
+        unrolled copy of the entire recurrence.
         """
         self._compiled_encode = torch.compile(self._encode_and_route, **compile_options)
         self._compiled_decode = torch.compile(self._decode, **compile_options)
-        if isinstance(self.main, TitansMain):
-            self.main.model.compile_memory(**compile_options)
+        self.main.compile_layers(**compile_options)
 
     def set_gradient_checkpointing(self, enabled):
         """Recompute each byte layer and main-network layer in the backward pass."""
@@ -256,7 +270,10 @@ class HNetForCausalLM(nn.Module):
         return h, p, b, cos, sin, aux
 
     def _run_main_and_smooth(self, chunks, positions, p):
-        z = self.down_proj(self.main(self.up_proj(chunks)))
+        # Under autocast up_proj gives BF16, but every main layer after the
+        # first sees the residual stream in the dtype of the norms (FP32). One
+        # dtype from the start halves the graph variants of the compiled layers.
+        z = self.down_proj(self.main(self.up_proj(chunks).to(chunks.dtype)))
         smoothing = smooth if self.smoothing == "blocked" else smooth_dense
         return smoothing(z, torch.gather(p, 1, positions))
 

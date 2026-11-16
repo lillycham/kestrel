@@ -37,6 +37,16 @@ def memory_update(state, kc, vc, a_i, e_i, t_i, chunk_size):
     return (1.0 - a_i) * w1 + s1, (1.0 - a_i) * w2 + s2, s1, s2
 
 
+def memory_step(state, kc, vc, a_i, e_i, t_i, q_next, chunk_size):
+    """Update on one chunk, then retrieve the next chunk from the new state.
+
+    One call per chunk (instead of an update call and a retrieve call) halves
+    the compiled-function calls and autograd nodes of the recurrence.
+    """
+    state = memory_update(state, kc, vc, a_i, e_i, t_i, chunk_size)
+    return state, memory_retrieve(q_next, state[0], state[1])
+
+
 class NeuralMemory(nn.Module):
     """Two-layer fast-weight MLP memory updated per chunk via closed-form MSE gradients."""
 
@@ -52,6 +62,7 @@ class NeuralMemory(nn.Module):
         self.min_forget = min_forget
         self._compiled_retrieve = None
         self._compiled_update = None
+        self._compiled_step = None
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
@@ -64,11 +75,6 @@ class NeuralMemory(nn.Module):
         self.w2_init = nn.Parameter(torch.empty(*init_shape_w2))
         nn.init.normal_(self.w1_init, std=self.head_dim ** -0.5)
         nn.init.normal_(self.w2_init, std=self.mem_head_dim ** -0.5)
-
-    def _project_qkv(self, proj, x, bsz, num_chunks):
-        h = proj(x).view(bsz, num_chunks, self.chunk_size, self.heads, self.head_dim)
-        h = F.normalize(h, dim=-1).permute(0, 3, 1, 2, 4).contiguous()
-        return h.view(bsz * self.heads, num_chunks, self.chunk_size, self.head_dim).float()
 
     def _gates(self, chunk_ctx):
         """Per-head forget (alpha), momentum (eta) and inner-lr (theta) gates, shaped (B * H, n, 1, 1)."""
@@ -99,33 +105,53 @@ class NeuralMemory(nn.Module):
         return self._compiled_update(state, kc.contiguous(), vc.contiguous(), a_i.contiguous(),
                                      e_i.contiguous(), t_i.contiguous(), self.chunk_size)
 
+    def _step(self, state, kc, vc, a_i, e_i, t_i, q_next):
+        if self._compiled_step is None:
+            return memory_step(state, kc, vc, a_i, e_i, t_i, q_next, self.chunk_size)
+        return self._compiled_step(state, kc, vc, a_i, e_i, t_i, q_next, self.chunk_size)
+
     def forward(self, x, cache=None):
         if cache is not None:
             return self._forward_cached(x, cache)
+        return self.finish(self.recur(*self.prepare(x)), x)
+
+    def prepare(self, x):
+        """Project a whole sequence for the chunk recurrence. Free of Python branches on its length.
+
+        Returns chunk-major tensors, so chunk idx of q, k, v and of each gate
+        is a contiguous slice whose strides do not depend on the chunk count:
+        q, k, v are (n, B * H, C, d_h) and alpha, eta, theta are (n, B * H, 1, 1).
+        """
         bsz, seq_len, dim = x.shape
         c = self.chunk_size
-        pad = (c - seq_len % c) % c
-        if pad:
-            x = F.pad(x, (0, 0, 0, pad))
-        padded_len = x.shape[1]
-        num_chunks = padded_len // c
+        num_chunks = (seq_len + c - 1) // c
+        x = F.pad(x, (0, 0, 0, num_chunks * c - seq_len))
 
-        q = self._project_qkv(self.q_proj, x, bsz, num_chunks)
-        k = self._project_qkv(self.k_proj, x, bsz, num_chunks)
-        v = self._project_qkv(self.v_proj, x, bsz, num_chunks)
+        def project(proj):
+            h = F.normalize(proj(x).view(bsz, num_chunks, c, self.heads, self.head_dim), dim=-1)
+            h = h.permute(1, 0, 3, 2, 4).contiguous()
+            return h.view(num_chunks, bsz * self.heads, c, self.head_dim).float()
+
         # Average chunk hidden state drives scalar forget/momentum/lr gates per head.
-        alpha, eta, theta = self._gates(x.view(bsz, num_chunks, c, dim).mean(dim=2))
-        state = self._initial_state(bsz)
+        gates = self._gates(x.view(bsz, num_chunks, c, dim).mean(dim=2))
+        alpha, eta, theta = (g.transpose(0, 1).contiguous() for g in gates)
+        return project(self.q_proj), project(self.k_proj), project(self.v_proj), alpha, eta, theta, self._initial_state(bsz)
 
-        outputs = []
-        for idx in range(num_chunks):
-            # Retrieve from current memory state (before updating on chunk idx -> causal).
-            outputs.append(self._retrieve(q[:, idx], state[0], state[1]))
-            if idx + 1 < num_chunks:
-                state = self._update(state, k[:, idx], v[:, idx], alpha[:, idx], eta[:, idx], theta[:, idx])
+    def recur(self, q, k, v, alpha, eta, theta, state):
+        """The sequential chunk loop. Returns retrievals as (n, B * H, C, d_h)."""
+        # Retrieve each chunk from the state before its own update (causal).
+        outputs = [self._retrieve(q[0], state[0], state[1])]
+        for idx in range(q.shape[0] - 1):
+            state, retrieved = self._step(state, k[idx], v[idx], alpha[idx], eta[idx], theta[idx], q[idx + 1])
+            outputs.append(retrieved)
+        return torch.stack(outputs)
 
-        out = torch.cat(outputs, dim=1).view(bsz, self.heads, padded_len, self.head_dim)
-        out = out.permute(0, 2, 1, 3).contiguous().view(bsz, padded_len, dim)[:, :seq_len].to(x.dtype)
+    def finish(self, retrieved, x):
+        """Map retrievals back to (B, L, D) in the dtype of x, and project them."""
+        bsz, seq_len, dim = x.shape
+        num_chunks = retrieved.shape[0]
+        out = retrieved.view(num_chunks, bsz, self.heads, self.chunk_size, self.head_dim).permute(1, 0, 3, 2, 4)
+        out = out.reshape(bsz, num_chunks * self.chunk_size, dim)[:, :seq_len].to(x.dtype)
         return self.out_proj(out)
 
     def _forward_cached(self, x, cache):
@@ -245,6 +271,9 @@ def local_window_attention(q, k, v, window):
     bsz, heads, seq_len, dim = q.shape
     blocks = -(-seq_len // window)
     pad = blocks * window - seq_len
+    # Keep this branch. A dynamic-shape graph splits on it (two variants), but
+    # without it F.pad would get zero padding on these transposed inputs. Then
+    # it returns a strided clone, while traced graphs assume a contiguous result.
     if pad:
         q, k, v = (F.pad(t, (0, 0, 0, pad)) for t in (q, k, v))
 
@@ -286,16 +315,40 @@ class TitansMAGBlock(nn.Module):
         self.mag_gate = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = Qwen3MLP(config)
+        self._compiled_before = None
+        self._compiled_after = None
 
     def forward(self, x, cos, sin, cache=None):
+        if cache is not None:
+            h = self.input_layernorm(x)
+            attn_out = self.attn_norm(self.self_attn(h, cos, sin, cache.setdefault("attn", {})))
+            return self._combine(x, h, attn_out, self.memory(h, cache.setdefault("mem", {})))
+        if self._compiled_before is None:
+            h, attn_out, prepared = self._before_memory(x, cos, sin)
+            return self._after_memory(x, h, attn_out, self.memory.recur(*prepared))
+        # Only the length dimensions are dynamic. Batch and width stay static,
+        # so no guard can tie the batch size to an equal length.
+        for tensor in (x, cos, sin):
+            torch._dynamo.maybe_mark_dynamic(tensor, 1)
+        h, attn_out, prepared = self._compiled_before(x, cos, sin)
+        retrieved = self.memory.recur(*prepared)
+        torch._dynamo.maybe_mark_dynamic(h, 1)
+        torch._dynamo.maybe_mark_dynamic(attn_out, 1)
+        torch._dynamo.maybe_mark_dynamic(retrieved, 0)
+        return self._compiled_after(x, h, attn_out, retrieved)
+
+    def _before_memory(self, x, cos, sin):
         h = self.input_layernorm(x)
-        attn_cache, mem_cache = (None, None) if cache is None else (cache.setdefault("attn", {}), cache.setdefault("mem", {}))
-        attn_out = self.attn_norm(self.self_attn(h, cos, sin, attn_cache))
-        mem_out = self.mem_norm(self.memory(h, mem_cache))
+        return h, self.attn_norm(self.self_attn(h, cos, sin)), self.memory.prepare(h)
+
+    def _after_memory(self, x, h, attn_out, retrieved):
+        return self._combine(x, h, attn_out, self.memory.finish(retrieved, h))
+
+    def _combine(self, x, h, attn_out, memory_out):
+        mem_out = self.mem_norm(memory_out)
         gate = torch.sigmoid(self.mag_gate(h))
         x = x + (1.0 - gate) * attn_out + gate * mem_out
-        x = x + self.mlp(self.post_attention_layernorm(x))
-        return x
+        return x + self.mlp(self.post_attention_layernorm(x))
 
 
 class TitansMAGForCausalLM(nn.Module):
@@ -389,10 +442,28 @@ class TitansMAGForCausalLM(nn.Module):
         # layer instance or the variable number of chunks.
         retrieve = torch.compile(memory_retrieve, **compile_options)
         update = torch.compile(memory_update, **compile_options)
+        step = torch.compile(memory_step, **compile_options)
         for module in self.modules():
             if isinstance(module, NeuralMemory):
                 module._compiled_retrieve = retrieve
                 module._compiled_update = update
+                module._compiled_step = step
+
+    def compile_blocks(self, **compile_options):
+        """Compile every block for any sequence length, except its sequential memory loop.
+
+        Each block compiles as two regions: before the memory recurrence (norm,
+        attention, memory projections) and after it (memory output, gate, MLP).
+        The sequence dimension is dynamic, so a new length reuses the graphs.
+        All blocks share the code of these regions, so they share the graphs.
+        The loop between the regions stays in Python and calls the
+        fixed-shape memory kernels of compile_memory.
+        """
+        self.compile_memory(**compile_options)
+        for module in self.modules():
+            if isinstance(module, TitansMAGBlock):
+                module._compiled_before = torch.compile(module._before_memory, **compile_options)
+                module._compiled_after = torch.compile(module._after_memory, **compile_options)
 
     def set_gradient_checkpointing(self, enabled):
         """Recompute each block in the backward pass instead of storing its activations."""

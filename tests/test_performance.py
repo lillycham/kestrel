@@ -18,7 +18,7 @@ def cpu_threads():
     torch.set_num_threads(1)
 
 
-def tiny_hnet():
+def tiny_hnet(main="titans"):
     config = read_config(ROOT / "configs/hnet_titans.toml")
     config["model"].update(hidden_size=32, intermediate_size=64, num_attention_heads=4,
                            num_key_value_heads=2, head_dim=8, max_position_embeddings=64,
@@ -27,6 +27,10 @@ def tiny_hnet():
                                     num_attention_heads=4, num_key_value_heads=2, head_dim=8,
                                     memory_chunk_size=4, memory_hidden_size=32, memory_heads=2,
                                     attention_window=8, num_loops=2)
+    if main == "transformer":
+        config["model"]["main"] = {"network": "transformer", "hidden_size": 32, "intermediate_size": 64,
+                                   "num_hidden_layers": 2, "num_attention_heads": 4,
+                                   "num_key_value_heads": 2, "head_dim": 8}
     return config
 
 
@@ -103,11 +107,12 @@ def test_batched_muon_equivalence_and_resume(nesterov):
     assert standard.param_groups[1]["lr"] == 0.006
 
 
+@pytest.mark.parametrize("main", ["titans", "transformer"])
 @pytest.mark.parametrize("aot", [False, True])
-def test_compile_reuses_graphs_across_chunk_lengths(aot):
+def test_compile_reuses_graphs_across_chunk_lengths(aot, main):
     torch._dynamo.reset()
     torch.manual_seed(3)
-    model = make_model(tiny_hnet()["model"])
+    model = make_model(tiny_hnet(main)["model"])
     eager = copy.deepcopy(model)
     keys = set(model.state_dict())
     graphs = []
@@ -130,8 +135,12 @@ def test_compile_reuses_graphs_across_chunk_lengths(aot):
     model._compiled_encode = force(compiled_encode)
     eager._compiled_encode = force(eager_encode)
     x = torch.randint(7, 200, (2, 48))
+    # Chunk counts above the main attention window (8). The first three warm
+    # up every graph variant, in training and in evaluation: Titans graphs
+    # split on whether the memory chunks (4) and attention blocks (8) need
+    # padding. Later counts must reuse those graphs.
     count_after_warmup = None
-    for count in [12, 12, 16, 24, 8, 5]:
+    for visit, count in enumerate([12, 13, 16, 24, 9, 14, 21, 12, 40]):
         boundary = torch.zeros_like(x, dtype=torch.bool)
         boundary[:, torch.arange(count) * (48 // count)] = True
         model.zero_grad(set_to_none=True)
@@ -142,11 +151,45 @@ def test_compile_reuses_graphs_across_chunk_lengths(aot):
         (expected.logits.square().mean() + expected.aux_loss).backward()
         for a, b in zip(model.parameters(), eager.parameters()):
             torch.testing.assert_close(a.grad, b.grad)
-        if count_after_warmup is None:
+        with torch.no_grad():
+            torch.testing.assert_close(model(x).logits, eager(x).logits)
+        if visit == 2:
             count_after_warmup = len(graphs)
-            assert 3 <= count_after_warmup <= 6
-        else:
+            assert count_after_warmup <= 18
+        elif visit > 2:
             assert len(graphs) == count_after_warmup
+    torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("main", ["titans", "transformer"])
+def test_compiled_main_layers_see_one_dtype_under_autocast(main):
+    # Under BF16 autocast, up_proj gives BF16 but later layers see FP32. If the
+    # first layer got BF16, every graph variant would exist twice.
+    from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+    from kestrel.memory import TitansMAGBlock
+
+    torch._dynamo.reset()
+    torch.manual_seed(3)
+    model = make_model(tiny_hnet(main)["model"])
+    model.compile_submodules(backend="aot_eager")
+    encode, boundary = model._compiled_encode, None
+    def forced(x):
+        h, p, _, cos, sin, aux = encode(x)
+        return h, p, boundary, cos, sin, aux
+    model._compiled_encode = forced
+    x = torch.randint(7, 200, (2, 48))
+    for count in [12, 13, 16, 24, 9]:
+        boundary = torch.zeros_like(x, dtype=torch.bool)
+        boundary[:, :count] = True
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            output = model(x)
+        (output.logits.float().square().mean() + output.aux_loss).backward()
+    if main == "titans":
+        regions = [TitansMAGBlock._before_memory, TitansMAGBlock._after_memory]
+    else:
+        regions = [type(model.main.model.layers[0]).forward]
+    # Titans: padded or not. Transformer: the first length, then dynamic.
+    assert all(len(_debug_get_cache_entry_list(f.__code__)) == 2 for f in regions)
     torch._dynamo.reset()
 
 
