@@ -575,6 +575,84 @@ def test_hnet_causality_and_train(tmp_path, main):
     sample(tmp_path / "run", "long", max_new_tokens=4, temperature=0, raw=True)
 
 
+def _hnet_model(tmp_path, main):
+    cfg = read_config(hnet_config(tmp_path, main))["model"]
+    torch.manual_seed(0)
+    model = make_model(cfg, {"bos_token_id": 1, "eos_token_id": 2, "pad_token_id": 0}).eval()
+    for module in model.modules():
+        if hasattr(module, "w1_init"):
+            module.gate_proj.weight.data.normal_(0.0, 1.0)  # Make the memory updates matter.
+    return cfg, model
+
+
+@pytest.mark.parametrize("main", ["transformer", "titans"])
+def test_hnet_cached_decode_matches_full_forward(tmp_path, main):
+    # The byte windows are 8; a Titans main network has memory chunks of 4 and a window of 8.
+    cfg, model = _hnet_model(tmp_path, main)
+    torch.manual_seed(1)
+    ids = torch.randint(7, 263, (1, cfg["max_position_embeddings"]))
+    with torch.no_grad():
+        full = model(ids)
+        assert 4 < full.boundaries.sum() < ids.shape[1] - 4  # chunks of more than one byte, and many chunks
+        for prompt_len in (1, 3, 13):
+            cache = {}
+            pieces = [model(ids[:, :prompt_len], cache=cache)]
+            pieces += [model(ids[:, t:t + 1], cache=cache) for t in range(prompt_len, ids.shape[1])]
+            torch.testing.assert_close(torch.cat([o.boundaries for o in pieces], dim=1), full.boundaries)
+            torch.testing.assert_close(torch.cat([o.logits for o in pieces], dim=1), full.logits, rtol=1e-4, atol=1e-4)
+        prompt = ids[:, :5]
+        torch.testing.assert_close(
+            model.generate(prompt, max_new_tokens=20, do_sample=False, use_cache=True),
+            model.generate(prompt, max_new_tokens=20, do_sample=False, use_cache=False),
+        )
+        with pytest.raises(ValueError, match="batch of one"):
+            model(ids.repeat(2, 1), cache={})
+
+
+@pytest.mark.parametrize("main", ["transformer", "titans"])
+def test_playground_hnet_backend(tmp_path, main):
+    pytest.importorskip("suzunaan")
+    from suzunaan import Prompt, views
+    from suzunaan.sample import sample as playground_sample
+    from kestrel.playground import KestrelBackend
+
+    training = tmp_path / "train.jsonl"
+    training.write_text("\n".join(json.dumps({"text": f"playground document {i}"}) for i in range(4)))
+    train_tokenizer(training, tmp_path / "tokenizer", 263)  # One fewer than vocab_size: an unused row.
+    cfg, model = _hnet_model(tmp_path, main)
+    torch.save({"config": {"model": cfg}, "model": model.state_dict()}, tmp_path / "latest.pt")
+
+    backend = KestrelBackend(tmp_path / "latest.pt", tmp_path / "tokenizer", torch.device("cpu"))
+    assert backend.hnet and backend.layers == cfg["encoder_layers"] + cfg["decoder_layers"]
+    assert backend.shape.startswith("H-Net")
+    ids = backend.prompt("text", {"text": "playground doc", "after_eot": True}).ids
+    assert len(ids) == 1 + len(b"playground doc")
+    with torch.no_grad():
+        torch.testing.assert_close(backend.logits(ids)[:-1], model(torch.tensor([ids])).logits[0, -1, :-1])
+    assert backend.logits(ids)[-1] == float("-inf")
+
+    # Every view runs, with one row per byte layer.
+    _, rows = views.attention_from(backend, ids, len(ids) - 1)
+    assert len(rows) == backend.layers and len(rows[0]) == backend.heads
+    _, lens = views.logit_lens(backend, ids, 0, len(ids))
+    assert len(lens) == backend.layers + 1
+    views.attention_matrix(backend, ids, backend.layers - 1, 1, 0, len(ids))
+    views.head_map(backend, ids)
+    _, active, _, _ = views.neuron_map(backend, ids, 0, 0, len(ids))
+    assert len(active) == backend.layers
+
+    # Cached sampling matches uncached, past the context too, with heads off or not.
+    prompt = Prompt(ids)
+    n = backend.context - len(ids) + 6
+    for ablate in [(), ((0, 1), (1, 2))]:
+        run = lambda: [t["id"] for t in playground_sample(backend, prompt, n, seed=3, top_k=20, ablate=ablate)]
+        cached = run()
+        backend.decoder = None
+        assert run() == cached
+        del backend.decoder
+        assert all(i < 263 for i in cached)
+
+
 @pytest.mark.parametrize("length,window", [(5, 8), (8, 8), (10, 4), (37, 8), (300, 64)])
 def test_local_window_attention_matches_dense(length, window):
     from kestrel.memory import dense_window_attention, local_window_attention

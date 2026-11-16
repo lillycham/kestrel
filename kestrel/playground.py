@@ -9,7 +9,7 @@ Titans model counts each run of a block as its own layer, in the order they run.
 
 An H-Net run shows its byte layers only: the encoder, then the decoder. The logit lens
 reads the encoder layers through the final norm too, although the model itself never
-does. Generation runs the whole prefix again at each byte, as there is no decode cache.
+does.
 """
 from contextlib import contextmanager
 from pathlib import Path
@@ -75,8 +75,6 @@ class KestrelBackend:
         self.head_dim, self.context, self.vocab = c.head_dim, c.max_position_embeddings, len(tokenizer)
         self.params = sum(p.numel() for p in model.parameters())
         if self.hnet:
-            # The H-Net has no decode cache yet: each step runs the whole prefix again.
-            self.decoder = None
             main = "Titans-MAG" if c.main_network == "titans" else "Qwen3"
             self.shape = (f"H-Net ({main} main, width {c.main_hidden_size}, ~{c.target_chunk_size:g} bytes/chunk), "
                           f"{len(model.encoder)} + {len(model.decoder)} byte layers x {self.heads} heads "
@@ -157,7 +155,7 @@ class KestrelBackend:
 
         def attn_hook(module, args, kwargs, out):
             if self.windowed:
-                h, cos, sin = args
+                h, cos, sin = args[:3]
                 window = module.window
             else:
                 h = kwargs["hidden_states"] if "hidden_states" in kwargs else args[0]
@@ -195,17 +193,18 @@ class KestrelBackend:
 class KestrelDecoder:
     """Cached generation for one sample: each call runs only the ids that the cache has
     not seen. Titans-MAG keeps its own cache dict (the sliding-window keys and values
-    and the memory state of each block run); Qwen3 keeps HF past_key_values. Within the
-    context both give the logits of KestrelBackend.logits."""
+    and the memory state of each block run), and so does the H-Net (its byte layers,
+    router and main network); Qwen3 keeps HF past_key_values. Within the context each
+    gives the logits of KestrelBackend.logits."""
 
     def __init__(self, backend):
         self.b, self.fed = backend, 0
-        self.cache = {} if backend.titans else None
+        self.cache = {} if backend.windowed else None
 
     def logits(self, ids):
         b = self.b
         x = torch.tensor([ids[self.fed:]], device=b.device)
-        if b.titans:
+        if b.windowed:
             out = b.model(x, cache=self.cache, logits_to_keep=1)
         else:
             out = b.model(x, past_key_values=self.cache, use_cache=True, logits_to_keep=1)

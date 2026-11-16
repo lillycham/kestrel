@@ -33,8 +33,8 @@ class SWABlock(nn.Module):
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = Qwen3MLP(config)
 
-    def forward(self, x, cos, sin):
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin)
+    def forward(self, x, cos, sin, cache=None):
+        x = x + self.self_attn(self.input_layernorm(x), cos, sin, cache)
         return x + self.mlp(self.post_attention_layernorm(x))
 
 
@@ -122,13 +122,14 @@ def smooth(z, p_chunk, block_size=64):
     return result.reshape(batch, -1, width)[:, :length].to(z.dtype)
 
 
-def upsample(zbar, b, p):
+def upsample(zbar, b, p, offset=0):
     """Give each byte the smoothed vector of its chunk, scaled by a straight-through confidence.
 
     The confidence is p at a boundary and 1 - p elsewhere. Its forward value is
-    1; its gradient reaches the router.
+    1; its gradient reaches the router. With offset 1, zbar starts with the
+    vector of a chunk that began before these bytes (the decode cache).
     """
-    index = b.long().cumsum(dim=1) - 1
+    index = b.long().cumsum(dim=1) - 1 + offset
     up = torch.gather(zbar, 1, index[..., None].expand(-1, -1, zbar.shape[-1]))
     confidence = torch.where(b, p, 1.0 - p)
     ste = confidence + (1.0 - confidence).detach()
@@ -143,8 +144,12 @@ class QwenMain(nn.Module):
         self.model = lm.model
         self.model.embed_tokens = None
 
-    def forward(self, x):
-        return self.model(inputs_embeds=x, use_cache=False).last_hidden_state
+    def forward(self, x, cache=None):
+        if cache is None:
+            return self.model(inputs_embeds=x, use_cache=False).last_hidden_state
+        out = self.model(inputs_embeds=x, past_key_values=cache.get("kv"), use_cache=True)
+        cache["kv"] = out.past_key_values
+        return out.last_hidden_state
 
     def compile_layers(self, **compile_options):
         """Compile each decoder layer; the layers share graphs.
@@ -179,8 +184,8 @@ class TitansMain(nn.Module):
         del lm.lm_head, lm.embed_tokens
         self.model = lm
 
-    def forward(self, x):
-        return self.model(inputs_embeds=x, hidden_only=True)
+    def forward(self, x, cache=None):
+        return self.model(inputs_embeds=x, hidden_only=True, cache=cache)
 
     def compile_layers(self, **compile_options):
         self.model.compile_blocks(**compile_options)
@@ -290,7 +295,9 @@ class HNetForCausalLM(nn.Module):
             x = x[:, -logits_to_keep:]
         return self.lm_head(self.norm(x))
 
-    def forward(self, input_ids, logits_to_keep=0, **kwargs):
+    def forward(self, input_ids, logits_to_keep=0, cache=None, **kwargs):
+        if cache is not None:
+            return self._forward_cached(input_ids, cache, logits_to_keep)
         encode_fn = self._compiled_encode or self._encode_and_route
         decode_fn = self._compiled_decode or self._decode
 
@@ -309,8 +316,55 @@ class HNetForCausalLM(nn.Module):
         }
         return SimpleNamespace(logits=logits, aux_loss=self.ratio_loss_weight * aux, boundaries=b)
 
+    def _forward_cached(self, input_ids, cache, logits_to_keep=0):
+        """Continue from the bytes that the cache dict holds; fill it on the first call.
+
+        The cache holds the key and value cache of each byte layer, the last
+        router key, the main network's cache, and the smoothed vector of the
+        last chunk. A byte's chunk starts at or before the byte, so each new
+        byte needs only what came before it. Within max_position_embeddings
+        this gives the logits of the full forward pass. One sequence only:
+        rows of a batch would make chunks at different bytes.
+        """
+        if input_ids.shape[0] != 1:
+            raise ValueError("The H-Net decode cache takes a batch of one sequence")
+        start, length = cache.get("pos", 0), input_ids.shape[1]
+        x = self.embed_tokens(input_ids)
+        pos = torch.arange(start, start + length, device=input_ids.device)[None, :]
+        cos, sin = self.rotary_emb(x, pos)
+        for layer, layer_cache in zip(self.encoder, cache.setdefault("encoder", [{} for _ in self.encoder])):
+            x = layer(x, cos, sin, layer_cache)
+        h = self.encoder_norm(x)
+        q, k = self.router_q(h), self.router_k(h)
+        if "k" in cache:
+            # The previous byte's key stands in for a query; its p is dropped.
+            p = boundary_probs(torch.cat([cache["k"], q], dim=1), torch.cat([cache["k"], k], dim=1))[:, 1:]
+        else:
+            p = boundary_probs(q, k)
+        cache["k"] = k[:, -1:]
+        b = p >= 0.5
+
+        prev = cache.get("zbar")
+        zbar = prev
+        if b.any():
+            chunks = h[b][None]
+            z = self.down_proj(self.main(self.up_proj(chunks).to(chunks.dtype), cache.setdefault("main", {})))
+            p_chunk = p[b][None]
+            if prev is not None:
+                # The last chunk's vector as a chunk with P = 1 carries the EMA on.
+                z, p_chunk = torch.cat([prev, z], dim=1), torch.cat([p_chunk.new_ones(1, 1), p_chunk], dim=1)
+            zbar = smooth(z, p_chunk)
+            cache["zbar"] = zbar[:, -1:]
+        x = upsample(zbar, b, p, offset=0 if prev is None else 1) + self.residual_proj(h)
+        for layer, layer_cache in zip(self.decoder, cache.setdefault("decoder", [{} for _ in self.decoder])):
+            x = layer(x, cos, sin, layer_cache)
+        cache["pos"] = start + length
+        if logits_to_keep:
+            x = x[:, -logits_to_keep:]
+        return SimpleNamespace(logits=self.lm_head(self.norm(x)), boundaries=b)
+
     @torch.no_grad()
-    def generate(self, input_ids, **kwargs):
-        """Sample bytes. Each step runs the whole window again; there is no decode cache yet."""
-        kwargs["use_cache"] = False
-        return TitansMAGForCausalLM.generate(self, input_ids, **kwargs)
+    def generate(self, input_ids, use_cache=True, **kwargs):
+        """Sample bytes. The decode cache takes one sequence, so a batch or a group runs without it."""
+        one = input_ids.shape[0] == 1 and kwargs.get("num_return_sequences", 1) == 1
+        return TitansMAGForCausalLM.generate(self, input_ids, use_cache=use_cache and one, **kwargs)
