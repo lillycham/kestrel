@@ -42,9 +42,9 @@ coda_layers = 1
 
 [train]
 steps = 25000
-batch_size = 8
+batch_size = 16
 sequence_length = 4096
-gradient_accumulation = 4
+gradient_accumulation = 2
 warmup_steps = 500
 decay_steps = 5000
 muon_lr = 0.02

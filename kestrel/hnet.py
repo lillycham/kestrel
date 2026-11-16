@@ -176,16 +176,17 @@ class HNetForCausalLM(nn.Module):
         self.last_stats = {}
         self.gradient_checkpointing = False
         self.chunk_bucket = 0
+        self._compiled_encode = None
+        self._compiled_main = None
+        self._compiled_decode = None
 
     def compile_submodules(self):
-        """Compile static byte blocks and bucketed main network without altering state_dict keys."""
+        """Compile whole encoder+router, main+smooth, and upsample+decoder+head paths."""
         self.chunk_bucket = 256
         torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 32)
-        for layer in self.encoder:
-            layer.compile()
-        self.main.compile()
-        for layer in self.decoder:
-            layer.compile()
+        self._compiled_encode = torch.compile(self._encode_and_route)
+        self._compiled_main = torch.compile(self._run_main_and_smooth)
+        self._compiled_decode = torch.compile(self._upsample_and_decode)
 
     def set_gradient_checkpointing(self, enabled):
         """Recompute each byte layer and main-network layer in the backward pass."""
@@ -203,28 +204,40 @@ class HNetForCausalLM(nn.Module):
     def get_output_embeddings(self):
         return self.lm_head
 
-    def forward(self, input_ids, logits_to_keep=0, **kwargs):
+    def _encode_and_route(self, input_ids):
         x = self.embed_tokens(input_ids)
         pos = torch.arange(input_ids.shape[1], device=input_ids.device)[None, :]
         cos, sin = self.rotary_emb(x, pos)
         for layer in self.encoder:
             x = self._layer(layer, x, cos, sin)
         h = self.encoder_norm(x)
-
         p = boundary_probs(self.router_q(h), self.router_k(h))
         b = p >= 0.5
-        chunks, positions, valid = downsample(h, b, bucket=self.chunk_bucket)
-        z = self.down_proj(self.main(self.up_proj(chunks)))
-        zbar = smooth(z, torch.gather(p, 1, positions))
-        x = upsample(zbar, b, p) + self.residual_proj(h)
+        aux = ratio_loss(p, b, self.target_chunk_size)
+        return h, p, b, cos, sin, aux
 
+    def _run_main_and_smooth(self, chunks, positions, p):
+        z = self.down_proj(self.main(self.up_proj(chunks)))
+        return smooth(z, torch.gather(p, 1, positions))
+
+    def _upsample_and_decode(self, zbar, b, p, h, cos, sin, logits_to_keep):
+        x = upsample(zbar, b, p) + self.residual_proj(h)
         for layer in self.decoder:
             x = self._layer(layer, x, cos, sin)
         if logits_to_keep:
             x = x[:, -logits_to_keep:]
-        logits = self.lm_head(self.norm(x))
+        return self.lm_head(self.norm(x))
 
-        aux = ratio_loss(p, b, self.target_chunk_size)
+    def forward(self, input_ids, logits_to_keep=0, **kwargs):
+        encode_fn = self._compiled_encode or self._encode_and_route
+        main_fn = self._compiled_main or self._run_main_and_smooth
+        decode_fn = self._compiled_decode or self._upsample_and_decode
+
+        h, p, b, cos, sin, aux = encode_fn(input_ids)
+        chunks, positions, valid = downsample(h, b, bucket=self.chunk_bucket)
+        zbar = main_fn(chunks, positions, p)
+        logits = decode_fn(zbar, b, p, h, cos, sin, logits_to_keep)
+
         self.last_stats = {
             "bytes_per_chunk": b.numel() / b.sum().clamp_min(1),
             "ratio_loss": aux.detach(),
