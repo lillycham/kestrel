@@ -44,4 +44,4 @@ eval_batches = 16
 save_every = 500
 seed = 42
 precision = "auto"
-compile = true
+compile = false  # A whole-model compile takes ~14 min here, longer than the training.
