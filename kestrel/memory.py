@@ -543,13 +543,13 @@ class TitansMAGForCausalLM(nn.Module):
                 b._compiled_before, b.health = c, None
 
     @torch.no_grad()
-    def memory_health(self, input_ids, dead_share=0.01, wipe_alpha=0.95, static_drift=1e-4):
+    def memory_health(self, input_ids, dead_share=0.01, wipe_alpha=0.95, static_drift=1e-3):
         """Run input_ids through the uncompiled blocks and summarise how each block call uses its memory."""
         with self.recording_memory() as calls:
             self(input_ids)
         return self.summarize_memory(calls, dead_share, wipe_alpha, static_drift)
 
-    def summarize_memory(self, calls, dead_share=0.01, wipe_alpha=0.95, static_drift=1e-4):
+    def summarize_memory(self, calls, dead_share=0.01, wipe_alpha=0.95, static_drift=1e-3):
         """A flat dict for the training log from the statistics of one forward pass.
 
         Per call: the memory share of the gated update after the first chunk,
