@@ -20,6 +20,10 @@ carry it.
 Conditions, for each gap G:
   base      the model as trained
   nowrite   every block call retrieves from W_init only (no test-time writes)
+  swap      every block call writes its memory from the next row's story: the
+            memory has its usual statistics, but another name. If swap falls
+            as far as nowrite, the memory carried the name; if it stays near
+            base, the nowrite loss comes from an unseen W_init state.
   noneedle  the needle names another candidate (same filler); this measures
             the prior of the model for the target name, the floor for recall
 """
@@ -119,10 +123,11 @@ def main():
                 print(f"skip gap {gap}: {length} tokens > {limit}")
                 continue
             row = res[gap] = {}
-            for cond in ("base", "nowrite", "noneedle"):
+            for cond in ("base", "nowrite", "swap", "noneedle"):
                 probe.nowrite = all_calls if cond == "nowrite" else set()
+                probe.swap = all_calls if cond == "swap" else set()
                 row[cond] = score(model, tok, filler, targets, others if cond == "noneedle" else targets, gap, ids, args.device)
-            probe.nowrite = set()
+            probe.nowrite, probe.swap = set(), set()
             print(f"{run.name:28s} gap {gap:4d}  " + "  ".join(
                 f"{c} top1 {r['top1']:.3f} nats {r['nats_over_chance']:+.2f}" for c, r in row.items())
                 + f"  (chance {row['base']['chance']:.3f})", flush=True)
