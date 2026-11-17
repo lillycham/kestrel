@@ -69,6 +69,13 @@ if [ -f "$RUN_DIR/latest.pt" ]; then
   RESUME_FLAG=(--resume)
 fi
 
+# STOP_AFTER stops at that absolute step and keeps the schedule of the full run,
+# so a later start without it resumes to the end.
+STOP_FLAG=()
+if [ -n "${STOP_AFTER:-}" ]; then
+  STOP_FLAG=(--stop-after "$STOP_AFTER")
+fi
+
 # Set WANDB_PROJECT to log to wandb. Without WANDB_API_KEY the run logs offline
 # into RUN_DIR-wandb on Drive (beside the run: train makes RUN_DIR itself); upload
 # it later with: wandb sync RUN_DIR-wandb/wandb/offline-run-*
@@ -89,4 +96,5 @@ python -m kestrel train \
   --output "$RUN_DIR" \
   --device auto \
   "${RESUME_FLAG[@]}" \
+  "${STOP_FLAG[@]}" \
   "${WANDB_FLAG[@]}"

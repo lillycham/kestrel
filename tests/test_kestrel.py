@@ -625,7 +625,10 @@ def test_hnet_causality_and_train(tmp_path, main):
     train(config_path, tmp_path / "encoded", tmp_path / "run", "cpu")
     records = [json.loads(line) for line in (tmp_path / "run/metrics.jsonl").read_text().splitlines()]
     assert all(r["bytes_per_chunk"] >= 1 and "ratio_loss" in r for r in records)
-    assert any("validation_loss" in r for r in records)
+    evaluated = [r for r in records if "validation_loss" in r]
+    assert evaluated
+    # A Titans main network logs its memory health; a transformer has no memory.
+    assert all(("memory/dead_calls" in r) == (main == "titans") for r in evaluated)
     sample(tmp_path / "run", "long", max_new_tokens=4, temperature=0, raw=True)
 
 

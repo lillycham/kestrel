@@ -1,5 +1,6 @@
 """Titans-MAG (Memory as Gate) causal language model with chunked closed-form neural memory."""
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import torch
@@ -508,14 +509,13 @@ class TitansMAGForCausalLM(nn.Module):
             core = [f"core{i}" for i in range(len(self.layers))]
         return prelude + core + [f"coda{i}" for i in range(len(getattr(self, "coda", [])))]
 
-    @torch.no_grad()
-    def memory_health(self, input_ids, dead_share=0.01, wipe_alpha=0.95):
-        """Run input_ids through the uncompiled blocks and summarise how each block call uses its memory.
+    @contextmanager
+    def recording_memory(self):
+        """Within this context the blocks run uncompiled and append their memory statistics to the yielded list.
 
-        Returns a flat dict for the training log: per call, the memory share of
-        the gated update after the first chunk, the mean MAG gate and the mean
-        forget gate; overall, the number of dead calls (share below dead_share)
-        and the fraction of heads whose forget gate wipes the memory.
+        A caller that runs this model inside a larger one (the H-Net main
+        network) runs the larger model here, then passes the list to
+        summarize_memory.
         """
         blocks = [m for m in self.modules() if isinstance(m, TitansMAGBlock)]
         compiled = [b._compiled_before for b in blocks]
@@ -523,10 +523,26 @@ class TitansMAGForCausalLM(nn.Module):
         try:
             for b in blocks:
                 b._compiled_before, b.health = None, calls
-            self(input_ids)
+            yield calls
         finally:
             for b, c in zip(blocks, compiled):
                 b._compiled_before, b.health = c, None
+
+    @torch.no_grad()
+    def memory_health(self, input_ids, dead_share=0.01, wipe_alpha=0.95):
+        """Run input_ids through the uncompiled blocks and summarise how each block call uses its memory."""
+        with self.recording_memory() as calls:
+            self(input_ids)
+        return self.summarize_memory(calls, dead_share, wipe_alpha)
+
+    def summarize_memory(self, calls, dead_share=0.01, wipe_alpha=0.95):
+        """A flat dict for the training log from the statistics of one forward pass.
+
+        Per call: the memory share of the gated update after the first chunk,
+        the mean MAG gate and the mean forget gate. Overall: the number of dead
+        calls (share below dead_share) and the fraction of heads whose forget
+        gate wipes the memory.
+        """
         out = {}
         for label, s in zip(self._call_labels(), calls, strict=True):
             out[f"memory/share/{label}"] = s["share"].item()

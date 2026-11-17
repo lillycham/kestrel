@@ -257,6 +257,20 @@ class HNetForCausalLM(nn.Module):
         self.gradient_checkpointing = enabled
         self.main.set_gradient_checkpointing(enabled)
 
+    @torch.no_grad()
+    def memory_health(self, input_ids):
+        """The memory statistics of a Titans-MAG main network (see TitansMAGForCausalLM.memory_health), else {}.
+
+        The rows of the chunk sequence are padded at the end, so the padding
+        chunks count in the statistics too. They are few at a normal router rate.
+        """
+        main = getattr(self.main, "model", None)
+        if not isinstance(main, TitansMAGForCausalLM):
+            return {}
+        with main.recording_memory() as calls:
+            self(input_ids)
+        return main.summarize_memory(calls)
+
     def _layer(self, layer, x, cos, sin):
         if self.gradient_checkpointing and torch.is_grad_enabled():
             return checkpoint(layer, x, cos, sin, use_reentrant=False)

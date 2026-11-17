@@ -2,6 +2,7 @@
 # Start (or resume) the byte-level H-Net training run on a Colab GPU, with the colab CLI.
 #
 #   scripts/colab_hnet.sh L4      # or A100
+#   CONFIG=configs/hnet_titans_anchor.toml RUN_NAME=hnet-titans-anchor-1 STOP_AFTER=1500 scripts/colab_hnet.sh L4
 #
 # The run uses the committed HEAD, not the working tree. Data, checkpoints and a
 # console log go to Google Drive, so a run that Colab reclaims resumes from
@@ -52,5 +53,5 @@ echo "Check with: $COLAB status -s $SESSION. Stop the VM with: $COLAB stop -s $S
 # The cell keeps the kernel busy, so Colab does not see the session as idle.
 "$COLAB" exec -s "$SESSION" --timeout 0 <<EOF
 !rm -rf /content/kestrel && mkdir -p /content/kestrel && tar -xzf /content/kestrel.tar.gz -C /content/kestrel
-!cd /content/kestrel && CONFIG=$CONFIG VOCAB_SIZE=263 DATA_DIR=$DRIVE/data-bytes RAW_DIR=$DRIVE/data/raw RUN_DIR=$DRIVE/$RUN_NAME WANDB_PROJECT=${WANDB_PROJECT:-} bash scripts/colab_run.sh 2>&1 | tee -a $DRIVE/$RUN_NAME.console.log
+!cd /content/kestrel && CONFIG=$CONFIG VOCAB_SIZE=263 DATA_DIR=$DRIVE/data-bytes RAW_DIR=$DRIVE/data/raw RUN_DIR=$DRIVE/$RUN_NAME WANDB_PROJECT=${WANDB_PROJECT:-} STOP_AFTER=${STOP_AFTER:-} bash scripts/colab_run.sh 2>&1 | tee -a $DRIVE/$RUN_NAME.console.log
 EOF
