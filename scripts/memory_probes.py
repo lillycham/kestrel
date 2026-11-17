@@ -8,8 +8,11 @@ For each block call (prelude, each loop of each core layer, coda) it records:
 
 It also runs ablations and reports the loss by chunk: "nowrite" retrieves every
 chunk from W_init (the memory never learns in context), "nomem" removes the
-memory branch from the MAG sum. Chunk 0 never sees a write, so its loss must
-not change under "nowrite": that is the sanity check.
+memory branch from the MAG sum, and "swap" writes each memory from another
+sequence in the batch. Swap keeps the memory state in its usual range but
+gives it the wrong content, so its cost is the sequence-specific information
+that the writes carry. Chunk 0 never sees a write, so its loss must not change
+under "nowrite" or "swap": that is the sanity check.
 
     python scripts/memory_probes.py runs/titans-loop-anneal-1 --data data/anneal-prepared
 """
@@ -63,6 +66,7 @@ class Probe:
         self.record = False
         self.rank_batch = 0           # sequences per batch whose write rank is measured
         self.nowrite = set()          # block calls that never write
+        self.swap = set()             # block calls whose memory is written from another sequence
         self.nomem = set()            # block calls without the memory branch
         self.constgate = set()        # block calls whose MAG gate is its per-dimension mean
         self.gate_means = {}          # block call -> (D,) mean gate, from the recorded pass
@@ -126,6 +130,11 @@ class Probe:
             outputs = [memory_retrieve(q[0], w1_0, w2_0)]
             decay = torch.ones_like(alpha[0])
             nowrite = self.call in self.nowrite
+            if self.call in self.swap:
+                # Write the memory from the next sequence in the batch (rows are batch-major,
+                # so a roll by `heads` rows keeps each head on its own head). The state has
+                # its usual statistics, but the content of another story.
+                k, v, alpha, eta, theta = (t.roll(memory.heads, dims=1) for t in (k, v, alpha, eta, theta))
             rows = self.rank_batch * memory.heads
             norms, ranks = [], []
             for idx in range(q.shape[0] - 1):
@@ -166,12 +175,12 @@ def batches(data, seq_len, num_seqs, batch_size, device):
 @torch.no_grad()
 def token_losses(model, probe, args, **setting):
     probe.nowrite, probe.nomem = setting.get("nowrite", set()), setting.get("nomem", set())
-    probe.constgate = setting.get("constgate", set())
+    probe.constgate, probe.swap = setting.get("constgate", set()), setting.get("swap", set())
     out = []
     for inputs, targets in batches(args.data, args.seq_len, args.num_seqs, args.batch_size, args.device):
         logits = model(inputs).logits.float()
         out.append(F.cross_entropy(logits.transpose(1, 2), targets, reduction="none").cpu())
-    probe.nowrite, probe.nomem, probe.constgate = set(), set(), set()
+    probe.nowrite, probe.nomem, probe.constgate, probe.swap = set(), set(), set(), set()
     return torch.cat(out)  # (N, L)
 
 
@@ -216,7 +225,9 @@ def main():
               "loss": {"base": by_chunk(base, chunk)}, "calls": {}}
 
     # 2. Global ablations.
-    ablations = [] if args.stats_only else [("nowrite", {"nowrite": calls})] + ([] if args.skip_nomem else [("nomem", {"nomem": calls})])
+    ablations = [] if args.stats_only else (
+        [("nowrite", {"nowrite": calls}), ("swap", {"swap": calls})]
+        + ([] if args.skip_nomem else [("nomem", {"nomem": calls})]))
     for name, setting in ablations:
         result["loss"][name] = by_chunk(token_losses(model, probe, args, **setting), chunk)
         print(f"{name} {time.time() - t0:.0f}s", flush=True)
@@ -234,9 +245,10 @@ def main():
             label: by_chunk(token_losses(model, probe, args, constgate={c}), chunk) for c, label in enumerate(labels)}
         print(f"const-gate ablations {time.time() - t0:.0f}s, dead calls {result['dead_calls']}", flush=True)
     if args.per_call:
-        result["loss"]["nowrite_one"] = {}
+        result["loss"]["nowrite_one"], result["loss"]["swap_one"] = {}, {}
         for c, label in enumerate(labels):
             result["loss"]["nowrite_one"][label] = by_chunk(token_losses(model, probe, args, nowrite={c}), chunk)
+            result["loss"]["swap_one"][label] = by_chunk(token_losses(model, probe, args, swap={c}), chunk)
         print(f"per-call ablations {time.time() - t0:.0f}s", flush=True)
 
     # 3. Per-call statistics.
