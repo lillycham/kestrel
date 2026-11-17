@@ -154,6 +154,31 @@ def test_titans_mag_causality_and_train(tmp_path):
     prepare(training, validation, tokenizer_path, data_path)
     train(ROOT / "configs/titans_smoke.toml", data_path, tmp_path / "titans", "cpu")
     sample(tmp_path / "titans", "long", max_new_tokens=4, temperature=0, raw=True)
+    records = [json.loads(line) for line in (tmp_path / "titans/metrics.jsonl").read_text().splitlines()]
+    evaluated = [r for r in records if "validation_loss" in r]
+    assert evaluated and all("memory/dead_calls" in r and "memory/share/core0" in r for r in evaluated)
+
+
+def test_titans_memory_health_finds_wiped_memory():
+    cfg = read_config(ROOT / "configs/titans_smoke.toml")
+    torch.manual_seed(0)
+    model = make_model(cfg["model"]).eval()
+    x = torch.randint(10, 100, (2, 32))
+    labels = model._call_labels()
+    stats = model.memory_health(x)
+    assert {f"memory/{kind}/{label}" for kind in ("share", "gate", "alpha") for label in labels} <= stats.keys()
+    assert stats["memory/dead_calls"] == 0
+    # The model must run as before once the statistics are collected.
+    assert all(b.health is None for b in model.modules() if hasattr(b, "health"))
+
+    # A forget gate stuck at 1 wipes W_init on the first write. Near W = 0 the
+    # update gradients vanish, so the memory cannot recover and every call is dead.
+    for module in model.modules():
+        if hasattr(module, "forget_bias"):
+            module.forget_bias = 50.0
+    stats = model.memory_health(x)
+    assert stats["memory/wiping_heads"] == 1.0
+    assert stats["memory/dead_calls"] == len(labels)
 
 
 def test_precision_and_compile_config(tmp_path):

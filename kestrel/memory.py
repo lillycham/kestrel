@@ -317,6 +317,8 @@ class TitansMAGBlock(nn.Module):
         self.mlp = Qwen3MLP(config)
         self._compiled_before = None
         self._compiled_after = None
+        # A list while TitansMAGForCausalLM.memory_health runs: each call appends its statistics.
+        self.health = None
 
     def forward(self, x, cos, sin, cache=None):
         if cache is not None:
@@ -325,7 +327,10 @@ class TitansMAGBlock(nn.Module):
             return self._combine(x, h, attn_out, self.memory(h, cache.setdefault("mem", {})))
         if self._compiled_before is None:
             h, attn_out, prepared = self._before_memory(x, cos, sin)
-            return self._after_memory(x, h, attn_out, self.memory.recur(*prepared))
+            retrieved = self.memory.recur(*prepared)
+            if self.health is not None:
+                self.health.append(self._memory_health(h, attn_out, prepared[3], retrieved))
+            return self._after_memory(x, h, attn_out, retrieved)
         # Only the length dimensions are dynamic. Batch and width stay static,
         # so no guard can tie the batch size to an equal length.
         for tensor in (x, cos, sin):
@@ -349,6 +354,22 @@ class TitansMAGBlock(nn.Module):
         gate = torch.sigmoid(self.mag_gate(h))
         x = x + (1.0 - gate) * attn_out + gate * mem_out
         return x + self.mlp(self.post_attention_layernorm(x))
+
+    def _memory_health(self, h, attn_out, alpha, retrieved):
+        """How much this block call uses its memory. alpha is (n, B * H, 1, 1).
+
+        share is the memory's part of the gated update after the first chunk,
+        which is the only chunk that reads W_init before any write. A memory
+        whose forget gate wiped it to W = 0 cannot write again (both update
+        gradients vanish there), and its share falls to about 0.
+        """
+        c = self.memory.chunk_size
+        gate = torch.sigmoid(self.mag_gate(h)).float()
+        mem = (gate * self.mem_norm(self.memory.finish(retrieved, h)).float()).norm(dim=-1)[:, c:]
+        attn = ((1.0 - gate) * attn_out.float()).norm(dim=-1)[:, c:]
+        share = (mem / (mem + attn).clamp_min(1e-12)).mean() if mem.numel() else torch.full((), float("nan"))
+        alpha = alpha[..., 0, 0].view(alpha.shape[0], -1, self.memory.heads).mean(dim=(0, 1))
+        return {"gate": gate.mean(), "share": share, "alpha": alpha}
 
 
 class TitansMAGForCausalLM(nn.Module):
@@ -464,6 +485,44 @@ class TitansMAGForCausalLM(nn.Module):
             if isinstance(module, TitansMAGBlock):
                 module._compiled_before = torch.compile(module._before_memory, **compile_options)
                 module._compiled_after = torch.compile(module._after_memory, **compile_options)
+
+    def _call_labels(self):
+        prelude = [f"prelude{i}" for i in range(len(getattr(self, "prelude", [])))]
+        if self.num_loops > 1:
+            core = [f"loop{l}.core{i}" for l in range(self.num_loops) for i in range(len(self.layers))]
+        else:
+            core = [f"core{i}" for i in range(len(self.layers))]
+        return prelude + core + [f"coda{i}" for i in range(len(getattr(self, "coda", [])))]
+
+    @torch.no_grad()
+    def memory_health(self, input_ids, dead_share=0.01, wipe_alpha=0.95):
+        """Run input_ids through the uncompiled blocks and summarise how each block call uses its memory.
+
+        Returns a flat dict for the training log: per call, the memory share of
+        the gated update after the first chunk, the mean MAG gate and the mean
+        forget gate; overall, the number of dead calls (share below dead_share)
+        and the fraction of heads whose forget gate wipes the memory.
+        """
+        blocks = [m for m in self.modules() if isinstance(m, TitansMAGBlock)]
+        compiled = [b._compiled_before for b in blocks]
+        calls = []
+        try:
+            for b in blocks:
+                b._compiled_before, b.health = None, calls
+            self(input_ids)
+        finally:
+            for b, c in zip(blocks, compiled):
+                b._compiled_before, b.health = c, None
+        out = {}
+        for label, s in zip(self._call_labels(), calls, strict=True):
+            out[f"memory/share/{label}"] = s["share"].item()
+            out[f"memory/gate/{label}"] = s["gate"].item()
+            out[f"memory/alpha/{label}"] = s["alpha"].mean().item()
+        shares = torch.stack([s["share"] for s in calls])
+        alphas = torch.stack([s["alpha"] for s in calls])
+        out["memory/dead_calls"] = int((shares < dead_share).sum().item())
+        out["memory/wiping_heads"] = (alphas > wipe_alpha).float().mean().item()
+        return out
 
     def set_gradient_checkpointing(self, enabled):
         """Recompute each block in the backward pass instead of storing its activations."""

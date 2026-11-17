@@ -7,6 +7,7 @@ import math
 import os
 import shutil
 import time
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -89,6 +90,30 @@ def evaluate(model, stream, settings, device, autocast_ctx=nullcontext, assistan
     return sum(losses) / len(losses)
 
 
+@torch.no_grad()
+def memory_health(raw_model, stream, settings, device, autocast_ctx=nullcontext):
+    """Memory statistics of a Titans-MAG model on one fixed validation batch, or {} for other models."""
+    if not hasattr(raw_model, "memory_health"):
+        return {}
+    x, _ = batch(stream, settings, torch.Generator().manual_seed(settings["seed"] + 2), device)
+    raw_model.eval()
+    with autocast_ctx():
+        stats = raw_model.memory_health(x)
+    raw_model.train()
+    return stats
+
+
+def start_wandb(project, output, config, resume):
+    """Start a wandb run named after the output directory. A resumed run continues the same wandb run."""
+    import wandb  # Optional: only runs that ask for wandb need it.
+
+    id_file = output / "wandb_id.txt"
+    # wandb 0.30 dropped wandb.util.generate_id; any short lowercase id works.
+    run_id = id_file.read_text().strip() if resume and id_file.exists() else uuid.uuid4().hex[:8]
+    id_file.write_text(run_id + "\n")
+    return wandb.init(project=project, name=output.name, id=run_id, resume="allow", config=config)
+
+
 def checkpoint(path, model, optimizers, config, manifest, step, generator, device):
     payload = {
         "model": model.state_dict(), "optimizers": [o.state_dict() for o in optimizers],
@@ -105,7 +130,8 @@ def checkpoint(path, model, optimizers, config, manifest, step, generator, devic
     os.replace(temporary, path)
 
 
-def train(config_path, data_path, output, requested_device="auto", resume=False, stop_after=None, init_from=None):
+def train(config_path, data_path, output, requested_device="auto", resume=False, stop_after=None, init_from=None,
+          wandb_project=None):
     if resume and init_from is not None:
         raise ValueError("Cannot combine resume and init_from")
     config = read_config(config_path)
@@ -185,6 +211,7 @@ def train(config_path, data_path, output, requested_device="auto", resume=False,
     print(json.dumps({"device": str(device), "precision": precision, "compile": use_compile,
                       "parameters": sum(p.numel() for p in raw_model.parameters()),
                       "start_step": start, "end_step": end}), flush=True)
+    wandb_run = start_wandb(wandb_project, output, config, resume) if wandb_project else None
     model.train()
     started = time.monotonic()
     for step in range(start, end):
@@ -224,11 +251,15 @@ def train(config_path, data_path, output, requested_device="auto", resume=False,
         record["train_step_seconds"] = time.monotonic() - step_started
         if done % settings["eval_every"] == 0 or done == end:
             record["validation_loss"] = evaluate(model, validation_tokens, settings, device, autocast_ctx, assistant_tokens)
+            record.update(memory_health(raw_model, validation_tokens, settings, device, autocast_ctx))
         record["elapsed_seconds"] = time.monotonic() - started
         with (output / "metrics.jsonl").open("a") as log:
             log.write(json.dumps(record) + "\n")
+        if wandb_run is not None:
+            wandb_run.log(record, step=done)
         if "validation_loss" in record or done == start + 1:
-            print(json.dumps(record), flush=True)
+            # The per-call memory statistics stay in the log; the console gets the summary.
+            print(json.dumps({k: v for k, v in record.items() if k.count("/") < 2}), flush=True)
         if done % settings["save_every"] == 0 or done == end:
             checkpoint(output / "latest.pt", raw_model, optimizers, config, manifest, done, generator, device)
             if settings.get("keep_checkpoints", False):
@@ -236,6 +267,8 @@ def train(config_path, data_path, output, requested_device="auto", resume=False,
                 temp_snapshot = snapshot.with_suffix(".tmp")
                 shutil.copyfile(output / "latest.pt", temp_snapshot)
                 os.replace(temp_snapshot, snapshot)
+    if wandb_run is not None:
+        wandb_run.finish()
     return raw_model
 
 

@@ -11,6 +11,7 @@ dependencies = ["torch>=2.9", "transformers>=5.17,<6", "tokenizers>=0.23", "nump
 
 [project.optional-dependencies]
 flash2 = ["flash-attn>=2.8,<3"]
+wandb = ["wandb>=0.19"]
 
 [tool.setuptools.packages.find]
 include = ["kestrel*"]

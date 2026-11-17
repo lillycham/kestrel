@@ -52,5 +52,5 @@ echo "Check with: $COLAB status -s $SESSION. Stop the VM with: $COLAB stop -s $S
 # The cell keeps the kernel busy, so Colab does not see the session as idle.
 "$COLAB" exec -s "$SESSION" --timeout 0 <<EOF
 !rm -rf /content/kestrel && mkdir -p /content/kestrel && tar -xzf /content/kestrel.tar.gz -C /content/kestrel
-!cd /content/kestrel && CONFIG=$CONFIG VOCAB_SIZE=263 DATA_DIR=$DRIVE/data-bytes RAW_DIR=$DRIVE/data/raw RUN_DIR=$DRIVE/$RUN_NAME bash scripts/colab_run.sh 2>&1 | tee -a $DRIVE/$RUN_NAME.console.log
+!cd /content/kestrel && CONFIG=$CONFIG VOCAB_SIZE=263 DATA_DIR=$DRIVE/data-bytes RAW_DIR=$DRIVE/data/raw RUN_DIR=$DRIVE/$RUN_NAME WANDB_PROJECT=${WANDB_PROJECT:-} bash scripts/colab_run.sh 2>&1 | tee -a $DRIVE/$RUN_NAME.console.log
 EOF

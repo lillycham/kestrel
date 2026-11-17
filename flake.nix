@@ -14,7 +14,7 @@
       devShells = forAllSystems (pkgs:
         let
           pythonEnv = pkgs.python3.withPackages (ps: [
-            ps.torch ps.transformers ps.tokenizers ps.numpy ps.pytest ps.suzunaan
+            ps.torch ps.transformers ps.tokenizers ps.numpy ps.pytest ps.suzunaan ps.wandb
           ]);
         in {
           default = pkgs.mkShell {

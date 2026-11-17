@@ -28,6 +28,7 @@ def main():
     fitting.add_argument("--resume", action="store_true")
     fitting.add_argument("--init-from", help="Initialize model weights from an existing checkpoint")
     fitting.add_argument("--stop-after", type=int, help="Absolute step to stop at without altering the WSD horizon")
+    fitting.add_argument("--wandb", metavar="PROJECT", help="Also log metrics to this wandb project (needs wandb and a login)")
     generation = sub.add_parser("sample")
     generation.add_argument("--run", required=True)
     generation.add_argument("--prompt", required=True)
@@ -107,7 +108,8 @@ def main():
     elif command == "prepare":
         prepare(args["train"], args["validation"], args["tokenizer"], args["output"])
     elif command == "train":
-        train(args["config"], args["data"], args["output"], args["device"], args["resume"], args["stop_after"], args["init_from"])
+        train(args["config"], args["data"], args["output"], args["device"], args["resume"], args["stop_after"], args["init_from"],
+              args["wandb"])
     elif command == "sample":
         sample(args["run"], args["prompt"], args["device"], args["max_new_tokens"],
                args["temperature"], args["seed"], args["top_k"], args["top_p"], args["raw"],

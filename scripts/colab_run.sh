@@ -69,9 +69,24 @@ if [ -f "$RUN_DIR/latest.pt" ]; then
   RESUME_FLAG=(--resume)
 fi
 
+# Set WANDB_PROJECT to log to wandb. Without WANDB_API_KEY the run logs offline
+# into RUN_DIR-wandb on Drive (beside the run: train makes RUN_DIR itself); upload
+# it later with: wandb sync RUN_DIR-wandb/wandb/offline-run-*
+WANDB_FLAG=()
+if [ -n "${WANDB_PROJECT:-}" ]; then
+  python -c "import wandb" 2>/dev/null || python -m pip install -q wandb
+  export WANDB_DIR="$RUN_DIR-wandb"
+  mkdir -p "$WANDB_DIR"
+  if [ -z "${WANDB_API_KEY:-}" ]; then
+    export WANDB_MODE="${WANDB_MODE:-offline}"
+  fi
+  WANDB_FLAG=(--wandb "$WANDB_PROJECT")
+fi
+
 python -m kestrel train \
   --config "$CONFIG" \
   --data "$DATA_DIR/encoded" \
   --output "$RUN_DIR" \
   --device auto \
-  "${RESUME_FLAG[@]}"
+  "${RESUME_FLAG[@]}" \
+  "${WANDB_FLAG[@]}"
