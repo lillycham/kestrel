@@ -44,8 +44,10 @@ def memory_update(state, kc, vc, a_i, e_i, t_i, chunk_size):
     s2 = e_i * s2 - t_i * gw2
     if len(state) == 4:
         return (1.0 - a_i) * w1 + s1, (1.0 - a_i) * w2 + s2, s1, s2
+    # i + (1 - a)(w - i), written so that autograd saves only w and i, which exist
+    # anyway. The form with (w - i) saves a new (B * H, m_h, d_h) tensor per chunk.
     i1, i2 = state[4:]
-    return i1 + (1.0 - a_i) * (w1 - i1) + s1, i2 + (1.0 - a_i) * (w2 - i2) + s2, s1, s2, i1, i2
+    return (1.0 - a_i) * w1 + a_i * i1 + s1, (1.0 - a_i) * w2 + a_i * i2 + s2, s1, s2, i1, i2
 
 
 def memory_step(state, kc, vc, a_i, e_i, t_i, q_next, chunk_size):
