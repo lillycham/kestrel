@@ -45,12 +45,15 @@ num_loops = 3
 coda_layers = 1
 
 [train]
+# 4 x 8 here, not 8 x 4: the anchored pilot ran out of memory on an L4 at step 34, when
+# the router made over 2200 chunks per row. The batch generator draws the same
+# starts for 4 x 8 as for 8 x 4, so each step sees the data of hnet-titans-1.
 # 8 x 4 fits an L4 (22 GB) at early router rates: 20.8 GB peak at 2048 chunks per row.
 # 16 x 2 runs out of memory there. One config for both GPUs keeps a run resumable on either.
 steps = 25000
-batch_size = 8
+batch_size = 4
 sequence_length = 4096
-gradient_accumulation = 4
+gradient_accumulation = 8
 warmup_steps = 500
 decay_steps = 5000
 muon_lr = 0.02
@@ -58,7 +61,7 @@ adamw_lr = 0.001
 weight_decay = 0.01
 clip_norm = 1.0
 eval_every = 250
-eval_batches = 16
+eval_batches = 32  # 32 x 4 rows: the same 128 validation rows as 16 x 8 in hnet-titans-1.
 save_every = 1000
 keep_checkpoints = true
 seed = 42
