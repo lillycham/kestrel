@@ -167,8 +167,10 @@ def test_titans_memory_health_finds_wiped_memory():
     x = torch.randint(10, 100, (2, 32))
     labels = model._call_labels()
     stats = model.memory_health(x)
-    assert {f"memory/{kind}/{label}" for kind in ("share", "gate", "alpha") for label in labels} <= stats.keys()
+    kinds = ("share", "gate", "alpha", "theta", "drift")
+    assert {f"memory/{kind}/{label}" for kind in kinds for label in labels} <= stats.keys()
     assert stats["memory/dead_calls"] == 0
+    assert stats["memory/static_calls"] == 0
     # The model must run as before once the statistics are collected.
     assert all(b.health is None for b in model.modules() if hasattr(b, "health"))
 
@@ -193,6 +195,22 @@ def test_titans_decay_to_init_survives_a_full_forget():
     stats = model.memory_health(torch.randint(10, 100, (2, 32)))
     assert stats["memory/wiping_heads"] == 1.0
     assert stats["memory/dead_calls"] == 0
+    assert stats["memory/static_calls"] == 0
+
+    # With no inner lr the memory never writes and keeps W = W_init. Its share
+    # stays high, so it is not dead, but its drift shows that it is static.
+    for module in model.modules():
+        if hasattr(module, "forget_bias"):
+            gates = module._gates
+            module._gates = lambda ctx, gates=gates: (*gates(ctx)[:2], gates(ctx)[2] * 0.0)
+    stats = model.memory_health(torch.randint(10, 100, (2, 32)))
+    labels = model._call_labels()
+    assert stats["memory/dead_calls"] == 0
+    assert stats["memory/static_calls"] == len(labels)
+    assert all(stats[f"memory/theta/{label}"] == 0.0 for label in labels)
+    for module in model.modules():
+        if hasattr(module, "forget_bias"):
+            del module._gates
 
     # With no forget at all, the two rules are the same.
     memory = next(m for m in model.modules() if hasattr(m, "forget_bias"))

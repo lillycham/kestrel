@@ -346,7 +346,7 @@ class TitansMAGBlock(nn.Module):
             h, attn_out, prepared = self._before_memory(x, cos, sin)
             retrieved = self.memory.recur(*prepared)
             if self.health is not None:
-                self.health.append(self._memory_health(h, attn_out, prepared[3], retrieved))
+                self.health.append(self._memory_health(h, attn_out, prepared, retrieved))
             return self._after_memory(x, h, attn_out, retrieved)
         # Only the length dimensions are dynamic. Batch and width stay static,
         # so no guard can tie the batch size to an equal length.
@@ -372,21 +372,33 @@ class TitansMAGBlock(nn.Module):
         x = x + (1.0 - gate) * attn_out + gate * mem_out
         return x + self.mlp(self.post_attention_layernorm(x))
 
-    def _memory_health(self, h, attn_out, alpha, retrieved):
-        """How much this block call uses its memory. alpha is (n, B * H, 1, 1).
+    def _memory_health(self, h, attn_out, prepared, retrieved):
+        """How much this block call uses its memory, and how much its writes change what it reads.
 
         share is the memory's part of the gated update after the first chunk,
         which is the only chunk that reads W_init before any write. A memory
         whose forget gate wiped it to W = 0 cannot write again (both update
         gradients vanish there), and its share falls to about 0.
+
+        drift is the relative distance of the retrievals after the first chunk
+        from the retrievals of the same queries from W_init. A memory that never
+        writes (theta near 0) keeps W = W_init: it acts as a static MLP, its
+        share can stay high, and alpha gets no gradient. Only drift shows it.
         """
+        q, alpha, theta, state = prepared[0], prepared[3], prepared[5], prepared[6]
+        n, bh, c_len, d = q.shape
+        static = memory_retrieve(q.transpose(0, 1).reshape(bh, n * c_len, d), state[0], state[1])
+        static = static.view(bh, n, c_len, d).transpose(0, 1)[1:]
+        moved = (retrieved[1:].float() - static).norm()
+        drift = moved / static.norm().clamp_min(1e-12) if n > 1 else torch.full((), float("nan"))
         c = self.memory.chunk_size
         gate = torch.sigmoid(self.mag_gate(h)).float()
         mem = (gate * self.mem_norm(self.memory.finish(retrieved, h)).float()).norm(dim=-1)[:, c:]
         attn = ((1.0 - gate) * attn_out.float()).norm(dim=-1)[:, c:]
         share = (mem / (mem + attn).clamp_min(1e-12)).mean() if mem.numel() else torch.full((), float("nan"))
         alpha = alpha[..., 0, 0].view(alpha.shape[0], -1, self.memory.heads).mean(dim=(0, 1))
-        return {"gate": gate.mean(), "share": share, "alpha": alpha}
+        theta = theta[..., 0, 0].view(theta.shape[0], -1, self.memory.heads).mean(dim=(0, 1))
+        return {"gate": gate.mean(), "share": share, "alpha": alpha, "theta": theta, "drift": drift}
 
 
 class TitansMAGForCausalLM(nn.Module):
@@ -531,28 +543,35 @@ class TitansMAGForCausalLM(nn.Module):
                 b._compiled_before, b.health = c, None
 
     @torch.no_grad()
-    def memory_health(self, input_ids, dead_share=0.01, wipe_alpha=0.95):
+    def memory_health(self, input_ids, dead_share=0.01, wipe_alpha=0.95, static_drift=1e-4):
         """Run input_ids through the uncompiled blocks and summarise how each block call uses its memory."""
         with self.recording_memory() as calls:
             self(input_ids)
-        return self.summarize_memory(calls, dead_share, wipe_alpha)
+        return self.summarize_memory(calls, dead_share, wipe_alpha, static_drift)
 
-    def summarize_memory(self, calls, dead_share=0.01, wipe_alpha=0.95):
+    def summarize_memory(self, calls, dead_share=0.01, wipe_alpha=0.95, static_drift=1e-4):
         """A flat dict for the training log from the statistics of one forward pass.
 
         Per call: the memory share of the gated update after the first chunk,
-        the mean MAG gate and the mean forget gate. Overall: the number of dead
-        calls (share below dead_share) and the fraction of heads whose forget
-        gate wipes the memory.
+        the mean MAG gate, forget gate and inner lr, and the drift of the
+        retrievals from W_init. Overall: the number of dead calls (share below
+        dead_share), the number of static calls (alive, but drift below
+        static_drift: the memory never writes) and the fraction of heads whose
+        forget gate wipes the memory.
         """
         out = {}
         for label, s in zip(self._call_labels(), calls, strict=True):
             out[f"memory/share/{label}"] = s["share"].item()
             out[f"memory/gate/{label}"] = s["gate"].item()
             out[f"memory/alpha/{label}"] = s["alpha"].mean().item()
+            out[f"memory/theta/{label}"] = s["theta"].mean().item()
+            out[f"memory/drift/{label}"] = s["drift"].item()
         shares = torch.stack([s["share"] for s in calls])
+        drifts = torch.stack([s["drift"] for s in calls])
         alphas = torch.stack([s["alpha"] for s in calls])
-        out["memory/dead_calls"] = int((shares < dead_share).sum().item())
+        dead = shares < dead_share
+        out["memory/dead_calls"] = int(dead.sum().item())
+        out["memory/static_calls"] = int((~dead & (drifts < static_drift)).sum().item())
         out["memory/wiping_heads"] = (alphas > wipe_alpha).float().mean().item()
         return out
 
