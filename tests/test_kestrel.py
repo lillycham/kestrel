@@ -6,6 +6,7 @@ import torch
 
 from kestrel.core import make_model, make_optimizers, read_config, resolve_precision, wsd
 from kestrel.data import load_tokenizer, prepare, rows, train_tokenizer
+from kestrel.memory import memory_update
 from kestrel.train import chat, mask_assistant_targets, sample, train
 
 
@@ -181,6 +182,33 @@ def test_titans_memory_health_finds_wiped_memory():
     assert stats["memory/dead_calls"] == len(labels)
 
 
+def test_titans_decay_to_init_survives_a_full_forget():
+    cfg = dict(read_config(ROOT / "configs/titans_smoke.toml")["model"], memory_decay_to_init=True)
+    torch.manual_seed(0)
+    model = make_model(cfg).eval()
+    for module in model.modules():
+        if hasattr(module, "forget_bias"):
+            module.forget_bias = 50.0
+    # A full forget resets the memory to W_init, not to 0, so no call dies.
+    stats = model.memory_health(torch.randint(10, 100, (2, 32)))
+    assert stats["memory/wiping_heads"] == 1.0
+    assert stats["memory/dead_calls"] == 0
+
+    # With no forget at all, the two rules are the same.
+    memory = next(m for m in model.modules() if hasattr(m, "forget_bias"))
+    state = memory._initial_state(1)
+    kc, vc = torch.randn(2, memory.heads, 4, memory.head_dim).unbind(0)
+    gates = [torch.full((memory.heads, 1, 1), g) for g in (0.0, 0.5, 0.05)]
+    anchored = memory_update(state, kc, vc, *gates, 4)
+    plain = memory_update(state[:4], kc, vc, *gates, 4)
+    for a, p in zip(anchored[:4], plain, strict=True):
+        torch.testing.assert_close(a, p)
+
+    bad = dict(cfg, memory_decay_to_init="yes")
+    with pytest.raises(ValueError, match="memory_decay_to_init"):
+        make_model(bad)
+
+
 def test_precision_and_compile_config(tmp_path):
     base = (ROOT / "configs/smoke.toml").read_text()
     valid = tmp_path / "bf16.toml"
@@ -334,10 +362,11 @@ def test_looped_titans_mag_and_checkpoint_archive(tmp_path):
         make_model(bad_cfg["model"])
 
 
-@pytest.mark.parametrize("looped", [False, True])
-def test_titans_cached_decode_matches_full_forward(looped):
+@pytest.mark.parametrize("looped,decay_to_init", [(False, False), (True, False), (True, True)])
+def test_titans_cached_decode_matches_full_forward(looped, decay_to_init):
     # The prompt and each step cross memory-chunk (4) and attention-window (8) boundaries.
     cfg = dict(read_config(ROOT / "configs/titans_smoke.toml")["model"])
+    cfg["memory_decay_to_init"] = decay_to_init
     if looped:
         cfg.update(memory_hidden_size=32, memory_heads=4, memory_min_forget=0.05, norm_attn_branch=True,
                    num_hidden_layers=1, prelude_layers=1, num_loops=3, coda_layers=1)

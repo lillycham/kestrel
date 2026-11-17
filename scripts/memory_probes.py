@@ -133,7 +133,8 @@ class Probe:
                     outputs.append(memory_retrieve(q[idx + 1], w1_0, w2_0))
                     continue
                 state = memory_update(state, k[idx], v[idx], alpha[idx], eta[idx], theta[idx], memory.chunk_size)
-                decay = decay * (1.0 - alpha[idx])
+                if len(state) == 4:  # Decay toward 0. With decay_to_init, W - W_init is the written part.
+                    decay = decay * (1.0 - alpha[idx])
                 if self.record:
                     r1 = state[0] - decay * w1_0
                     r2 = state[1] - decay * w2_0

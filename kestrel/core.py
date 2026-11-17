@@ -22,7 +22,7 @@ def read_config(path):
         "max_position_embeddings", "tie_word_embeddings", "attention_bias",
         "attention_dropout", "rms_norm_eps", "rope_theta",
         "memory_chunk_size", "memory_hidden_size", "attention_window",
-        "memory_heads", "memory_forget_bias", "memory_min_forget", "norm_attn_branch",
+        "memory_heads", "memory_forget_bias", "memory_min_forget", "memory_decay_to_init", "norm_attn_branch",
         "num_loops", "prelude_layers", "coda_layers",
         "architecture", "encoder_layers", "decoder_layers", "target_chunk_size",
         "ratio_loss_weight", "main", "lr_multiplier",
@@ -78,7 +78,7 @@ def make_model(settings, special_ids=None):
     attention_window = settings.pop("attention_window", None)
     extra_titans = {
         key: settings.pop(key) for key in (
-            "memory_heads", "memory_forget_bias", "memory_min_forget",
+            "memory_heads", "memory_forget_bias", "memory_min_forget", "memory_decay_to_init",
             "norm_attn_branch", "num_loops", "prelude_layers", "coda_layers",
         ) if key in settings
     }
@@ -102,6 +102,7 @@ def make_model(settings, special_ids=None):
         forget_bias = extra_titans.get("memory_forget_bias", -2.0)
         min_forget = extra_titans.get("memory_min_forget", 0.0)
         norm_attn = extra_titans.get("norm_attn_branch", False)
+        decay_to_init = extra_titans.get("memory_decay_to_init", False)
         num_loops = extra_titans.get("num_loops", 1)
         prelude_layers = extra_titans.get("prelude_layers", 0)
         coda_layers = extra_titans.get("coda_layers", 0)
@@ -111,6 +112,8 @@ def make_model(settings, special_ids=None):
             raise ValueError("memory_forget_bias must be finite and 0 <= memory_min_forget < 1")
         if not isinstance(norm_attn, bool):
             raise ValueError("norm_attn_branch must be a boolean")
+        if not isinstance(decay_to_init, bool):
+            raise ValueError("memory_decay_to_init must be a boolean")
         if not isinstance(num_loops, int) or num_loops < 1 or not isinstance(prelude_layers, int) or prelude_layers < 0 or not isinstance(coda_layers, int) or coda_layers < 0:
             raise ValueError("num_loops >= 1 and prelude_layers/coda_layers >= 0 must be integers")
         config.memory_chunk_size = memory_chunk
@@ -128,7 +131,7 @@ def make_model(settings, special_ids=None):
 HNET_KEYS = {"encoder_layers", "decoder_layers", "target_chunk_size", "ratio_loss_weight", "main"}
 TITANS_KEYS = {
     "memory_chunk_size", "memory_hidden_size", "memory_heads", "memory_forget_bias",
-    "memory_min_forget", "norm_attn_branch", "num_loops", "prelude_layers", "coda_layers",
+    "memory_min_forget", "memory_decay_to_init", "norm_attn_branch", "num_loops", "prelude_layers", "coda_layers",
 }
 
 

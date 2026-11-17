@@ -21,8 +21,15 @@ def memory_retrieve(qc, w1, w2):
 
 
 def memory_update(state, kc, vc, a_i, e_i, t_i, chunk_size):
-    """One momentum step on the closed-form gradient of 0.5 / C * ||M(kc) - vc||^2."""
-    w1, w2, s1, s2 = state
+    """One momentum step on the closed-form gradient of 0.5 / C * ||M(kc) - vc||^2.
+
+    The state is (w1, w2, s1, s2), and the forget gate decays W toward 0. W = 0 is
+    then a trap: silu(0) = 0 and the MLP has no biases, so both gradients vanish
+    and a wiped memory never writes again. A state of (w1, w2, s1, s2, i1, i2)
+    decays toward the initial weights (i1, i2) instead, so a full forget
+    (a_i = 1) resets the memory to W_init and it can still learn.
+    """
+    w1, w2, s1, s2 = state[:4]
     hk = torch.bmm(kc, w1.transpose(1, 2))  # (B * H, C, m_h)
     ak, dsilu = _silu_and_grad(hk)
     pred = torch.bmm(ak, w2.transpose(1, 2))
@@ -34,7 +41,10 @@ def memory_update(state, kc, vc, a_i, e_i, t_i, chunk_size):
 
     s1 = e_i * s1 - t_i * gw1
     s2 = e_i * s2 - t_i * gw2
-    return (1.0 - a_i) * w1 + s1, (1.0 - a_i) * w2 + s2, s1, s2
+    if len(state) == 4:
+        return (1.0 - a_i) * w1 + s1, (1.0 - a_i) * w2 + s2, s1, s2
+    i1, i2 = state[4:]
+    return i1 + (1.0 - a_i) * (w1 - i1) + s1, i2 + (1.0 - a_i) * (w2 - i2) + s2, s1, s2, i1, i2
 
 
 def memory_step(state, kc, vc, a_i, e_i, t_i, q_next, chunk_size):
@@ -50,8 +60,10 @@ def memory_step(state, kc, vc, a_i, e_i, t_i, q_next, chunk_size):
 class NeuralMemory(nn.Module):
     """Two-layer fast-weight MLP memory updated per chunk via closed-form MSE gradients."""
 
-    def __init__(self, hidden_size, memory_hidden_size, chunk_size, heads=1, forget_bias=-2.0, min_forget=0.0):
+    def __init__(self, hidden_size, memory_hidden_size, chunk_size, heads=1, forget_bias=-2.0, min_forget=0.0,
+                 decay_to_init=False):
         super().__init__()
+        self.decay_to_init = decay_to_init
         self.hidden_size = hidden_size
         self.memory_hidden_size = memory_hidden_size
         self.chunk_size = chunk_size
@@ -91,7 +103,8 @@ class NeuralMemory(nn.Module):
         w2_base = self.w2_init.unsqueeze(0) if self.heads == 1 else self.w2_init
         w1 = w1_base.float().unsqueeze(0).expand(bsz, -1, -1, -1).reshape(bsz * self.heads, self.mem_head_dim, self.head_dim).clone()
         w2 = w2_base.float().unsqueeze(0).expand(bsz, -1, -1, -1).reshape(bsz * self.heads, self.head_dim, self.mem_head_dim).clone()
-        return w1, w2, torch.zeros_like(w1), torch.zeros_like(w2)
+        anchors = (w1, w2) if self.decay_to_init else ()  # Nothing writes in place, so W may share them.
+        return (w1, w2, torch.zeros_like(w1), torch.zeros_like(w2)) + anchors
 
     def _retrieve(self, qc, w1, w2):
         if self._compiled_retrieve is None:
@@ -310,6 +323,7 @@ class TitansMAGBlock(nn.Module):
             heads=getattr(config, "memory_heads", 1),
             forget_bias=getattr(config, "memory_forget_bias", -2.0),
             min_forget=getattr(config, "memory_min_forget", 0.0),
+            decay_to_init=getattr(config, "memory_decay_to_init", False),
         )
         self.mem_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mag_gate = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
